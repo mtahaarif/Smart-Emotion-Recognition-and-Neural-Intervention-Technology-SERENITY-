@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+backend/venv/
+database_app/venv/
+
+# Node / frontend build artifacts
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Environment and logs
+.env
+.env.*
+*.log
+
+# Runtime temp files
+tmp_*.wav
+*.tmp
+
+# Databases generated at runtime
+*.db
+*.sqlite
+*.sqlite3
+
+# OS/editor files
+desktop.ini
+Thumbs.db
+.DS_Store
+.vscode/
+
+# Legacy/deployment sub-workspace
+FYP_frontend/
+FYP_frontend/FYP_deployment/.git/
+FYP_frontend/FYP_deployment/node_modules/
+
+# Experimental artifacts not needed in source repo
+mess/
+
+# Runtime artifact
+backend/temp.wav
