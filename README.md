@@ -459,28 +459,27 @@ Get-Process python -ErrorAction SilentlyContinue | Stop-Process -Force
 4. Latency depends on local CPU/GPU saturation and model warm-up state.
 5. TTS path can be network-dependent.
 
-## 15. Hybrid Deployment Target (Pi + Azure)
-Planned architecture for hardware-compulsory deployment:
+## 15. Hybrid Deployment Target (Pi + AWS)
+Planned architecture for the hardware-compulsory deployment to bypass local compute constraints while adhering to a strict student cloud budget:
 
-### Keep on Raspberry Pi 5
+### Keep on Raspberry Pi 5 (Edge Node)
 1. Frontend UI, camera/mic capture
 2. Local auth/session management
-3. Sensitive local data storage and logs
-4. Lightweight preprocessing and privacy filtering
-5. Final response rendering and audio playback
+3. Sensitive local data storage (SQLite) and logs
+4. TFLite Edge Inference (Facial & Speech Emotion via XNNPACK delegate)
+5. Transcription (faster-whisper / Whisper Tiny)
+6. Final response rendering and Edge-TTS audio playback
 
-### Move to Azure cloud compute
-1. LLM inference worker
-2. Heavy STT worker when edge is overloaded
-3. Optional heavy emotion fusion and analytics worker
-4. Optional non-sensitive RAG retrieval service
+### Move to AWS Cloud Compute (Cloud Node)
+1. Heavy LLM inference worker (Qwen 2.5 1.5B)
+2. RAG embedding and FAISS retrieval service
 
-### Recommended Azure components
-1. IoT Hub for secure device channel
-2. Service Bus for asynchronous inference jobs
-3. GPU VM or AKS GPU for model workers
-4. ACR for container images
-5. Key Vault for secrets
-6. Monitor/Application Insights for observability
+### Recommended AWS Serverless / CPU Architecture
+*To circumvent student GPU quota limits and minimize costs:*
+1. **Amazon SQS (Simple Queue Service):** FIFO queues (`requests.fifo` and `results.fifo`) for asynchronous, resilient Edge-to-Cloud messaging that prevents Pi timeouts.
+2. **AWS EC2 (Graviton CPU):** A `c7g.xlarge` ARM-based Spot Instance to run the LLM inference.
+3. **llama.cpp (GGUF):** The Qwen LLM is quantized to 4-bit GGUF format to run blazingly fast on the EC2 Graviton CPU without needing an expensive NVIDIA GPU.
+4. **AWS IAM:** Strictly scoped access keys to secure the SQS payload transmission.
 
-This preserves privacy-sensitive data at the edge while offloading heavy compute.
+This hybrid event-driven architecture preserves privacy-sensitive data on the Edge while offloading heavy LLM generation to a highly cost-optimized AWS CPU instance.
+
