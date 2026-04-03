@@ -10,7 +10,7 @@ The project combines computer vision, speech processing, retrieval-augmented gen
 - Text-to-speech synthesis (edge-tts)
 - Local conversation memory (SQLite via SQLAlchemy)
 
-The current implementation is local-first and was tuned to work on constrained hardware. The architecture is also ready to evolve into a hybrid Raspberry Pi + Azure model-offload design.
+The current implementation is local-first and was tuned to work on constrained hardware. The architecture is also ready to evolve into a hybrid Raspberry Pi + AWS model-offload design.
 
 ## Table of Contents
 - [1. Project Vision](#1-project-vision)
