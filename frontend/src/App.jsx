@@ -4,6 +4,8 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
 const Login = lazy(() => import('./components/Login'));
 const Dashboard = lazy(() => import('./components/Dashboard'));
 const UnifiedEmotionPage = lazy(() => import('./pages/UnifiedEmotionPage'));
+const AdminPage = lazy(() => import('./pages/AdminPage'));
+const QuestionnairesPage = lazy(() => import('./pages/QuestionnairesPage'));
 
 function App() {
   const [user, setUser] = useState(() => localStorage.getItem('serenity_user'));
@@ -42,6 +44,14 @@ function App() {
           <Route
             path="/emotion/live"
             element={requireAuth(<UnifiedEmotionPage user={user} onLogout={handleLogout} />)}
+          />
+          <Route
+            path="/admin"
+            element={requireAuth(<AdminPage user={user} onLogout={handleLogout} />)}
+          />
+          <Route
+            path="/questionnaires"
+            element={requireAuth(<QuestionnairesPage user={user} onLogout={handleLogout} />)}
           />
           <Route
             path="*"

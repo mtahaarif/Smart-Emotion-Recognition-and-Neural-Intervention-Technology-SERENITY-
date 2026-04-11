@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import contextlib
+from datetime import datetime
 import importlib
 import json
 import logging
@@ -10,13 +11,14 @@ import threading
 import tempfile
 import time
 import uuid
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 
 try:
     import torch
@@ -26,15 +28,47 @@ except ImportError:
 try:
     from .audio_core import initialize_audio_runtime, predict_audio_emotion
     from .emotion_core import initialize_face_runtime, analyze_face
-    from .database import SessionLocal, engine, fetch_recent_turns, persist_turn
+    from .database import (
+        SessionLocal,
+        engine,
+        fetch_questionnaire_results,
+        fetch_recent_sessions_with_emotions,
+        fetch_recent_turn_summaries,
+        fetch_recent_turns,
+        persist_questionnaire_result,
+        persist_turn,
+    )
     from .cloud_llm_core import CloudLLMClient, CloudLLMError
+    from .questionnaires_data import (
+        QUESTIONNAIRE_DEFINITIONS,
+        normalize_questionnaire_type,
+        questionnaire_clinical_flags,
+        questionnaire_templates,
+        score_questionnaire,
+    )
     from . import models
 except ImportError:
     # Allow both package and direct module execution patterns.
     from backend.audio_core import initialize_audio_runtime, predict_audio_emotion
     from backend.emotion_core import initialize_face_runtime, analyze_face
-    from backend.database import SessionLocal, engine, fetch_recent_turns, persist_turn
+    from backend.database import (
+        SessionLocal,
+        engine,
+        fetch_questionnaire_results,
+        fetch_recent_sessions_with_emotions,
+        fetch_recent_turn_summaries,
+        fetch_recent_turns,
+        persist_questionnaire_result,
+        persist_turn,
+    )
     from backend.cloud_llm_core import CloudLLMClient, CloudLLMError
+    from backend.questionnaires_data import (
+        QUESTIONNAIRE_DEFINITIONS,
+        normalize_questionnaire_type,
+        questionnaire_clinical_flags,
+        questionnaire_templates,
+        score_questionnaire,
+    )
     import backend.models as models
 
 try:
@@ -88,12 +122,21 @@ class ChatRequest(BaseModel):
     username: str
     message: str
 
+
+class QuestionnaireSubmitRequest(BaseModel):
+    username: str
+    questionnaire_type: str
+    answers: List[int] = Field(default_factory=list)
+    submitted_at: Optional[str] = None
+
 EMOTION_LABELS = ["angry", "calm", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
 EMOTION_ALIAS = {
     "surprised": "surprise",
     "fearful": "fear",
     "no face": "neutral",
 }
+NEGATIVE_EMOTIONS = {"angry", "disgust", "fear", "sad"}
+POSITIVE_EMOTIONS = {"happy", "calm", "surprise"}
 SENTENCE_BOUNDARY_REGEX = re.compile(r"(?<=[.!?])\s+")
 SENTENCE_TERMINATOR_REGEX = re.compile(r"[.!?][\"')\]]*$")
 CAMEL_BOUNDARY_REGEX = re.compile(r"([a-z])([A-Z])")
@@ -149,6 +192,7 @@ STREAM_TOKEN_DELTA = _env_bool("SERENITY_STREAM_TOKEN_DELTA", True)
 STREAM_TTS_SENTENCE_AUDIO = _env_bool("SERENITY_STREAM_TTS_SENTENCE_AUDIO", True)
 STREAM_TTS_FINAL_TEXT_ONLY = _env_bool("SERENITY_STREAM_TTS_FINAL_TEXT_ONLY", False)
 TRUST_CLOUD_POLISHED_RESPONSE = _env_bool("SERENITY_TRUST_CLOUD_POLISHED_RESPONSE", True)
+CLOUD_LLM_LAZY_INIT = _env_bool("SERENITY_CLOUD_LLM_LAZY_INIT", EDGE_OPTIMIZED_MODE)
 CLOUD_LLM_WARMUP_ENABLED = _env_bool("SERENITY_CLOUD_LLM_WARMUP_ENABLED", not EDGE_OPTIMIZED_MODE)
 CLOUD_LLM_WARMUP_TEXT = os.getenv("SERENITY_CLOUD_LLM_WARMUP_TEXT", "Hello").strip() or "Hello"
 CLOUD_LLM_WARMUP_TIMEOUT_SECONDS = int(os.getenv("SERENITY_CLOUD_LLM_WARMUP_TIMEOUT_SECONDS", "45"))
@@ -166,6 +210,7 @@ llm_generation_semaphore = asyncio.Semaphore(1)
 tts_consecutive_failures = 0
 tts_disabled_until_epoch = 0.0
 whisper_init_lock = threading.Lock()
+cloud_llm_init_lock = threading.Lock()
 
 
 def _state_get(key: str, default=None):
@@ -174,6 +219,135 @@ def _state_get(key: str, default=None):
 
 def _state_set(key: str, value) -> None:
     setattr(app.state, key, value)
+
+
+def _ensure_cloud_llm_client_sync() -> Tuple[Optional[CloudLLMClient], Optional[str], bool]:
+    cloud_llm_client = _state_get("cloud_llm_client")
+    if cloud_llm_client is not None:
+        return cloud_llm_client, None, False
+
+    with cloud_llm_init_lock:
+        cloud_llm_client = _state_get("cloud_llm_client")
+        if cloud_llm_client is not None:
+            return cloud_llm_client, None, False
+
+        try:
+            cloud_llm_client = CloudLLMClient()
+            _state_set("cloud_llm_client", cloud_llm_client)
+            _state_set("rag_init_error", None)
+            LOGGER.info("Cloud LLM API client initialized on-demand")
+            return cloud_llm_client, None, True
+        except CloudLLMError as exc:
+            error_text = str(exc)
+            _state_set("rag_init_error", error_text)
+            LOGGER.warning("Cloud LLM lazy initialization failed: %s", exc)
+            return None, error_text, False
+
+
+async def _ensure_cloud_llm_client() -> Tuple[Optional[CloudLLMClient], Optional[str]]:
+    cloud_llm_client = _state_get("cloud_llm_client")
+    if cloud_llm_client is not None:
+        return cloud_llm_client, None
+
+    client, error_text, created = await run_in_threadpool(_ensure_cloud_llm_client_sync)
+    if client is not None and created and CLOUD_LLM_WARMUP_ENABLED:
+        warmup_task = _state_get("cloud_llm_warmup_task")
+        if warmup_task is None or warmup_task.done():
+            _state_set("cloud_llm_warmup_task", asyncio.create_task(_warmup_cloud_llm_once()))
+
+    return client, error_text
+
+
+def _parse_optional_datetime(value: Optional[str]) -> Optional[datetime]:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+
+    normalized = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone().replace(tzinfo=None)
+
+    return parsed
+
+
+def _normalize_emotion_label(emotion: str) -> str:
+    value = str(emotion or "neutral").strip().lower()
+    if not value:
+        return "neutral"
+    return EMOTION_ALIAS.get(value, value)
+
+
+def _build_admin_summary(
+    total_users: int,
+    emotion_counts: Dict[str, int],
+    latest_scores_by_type: Dict[str, List[int]],
+    flagged_user_count: int,
+) -> str:
+    if total_users <= 0:
+        return "No user records found yet. Ask users to complete chats or questionnaires to generate insights."
+
+    total_emotion_samples = sum(int(count) for count in emotion_counts.values())
+    negative_samples = sum(
+        int(count)
+        for emotion, count in emotion_counts.items()
+        if _normalize_emotion_label(emotion) in NEGATIVE_EMOTIONS
+    )
+    positive_samples = sum(
+        int(count)
+        for emotion, count in emotion_counts.items()
+        if _normalize_emotion_label(emotion) in POSITIVE_EMOTIONS
+    )
+
+    summary_parts: List[str] = []
+    if total_emotion_samples > 0:
+        negative_ratio = round((negative_samples / total_emotion_samples) * 100.0, 1)
+        positive_ratio = round((positive_samples / total_emotion_samples) * 100.0, 1)
+        summary_parts.append(
+            f"Emotion logs show {negative_ratio}% negative-leaning and {positive_ratio}% positive-leaning observations."
+        )
+
+    if latest_scores_by_type:
+        score_bits: List[str] = []
+        for questionnaire_type in ("PHQ-9", "GAD-7", "PCL-5"):
+            values = latest_scores_by_type.get(questionnaire_type) or []
+            if not values:
+                continue
+            average_score = round(sum(values) / len(values), 1)
+            score_bits.append(f"{questionnaire_type} avg {average_score}")
+        if score_bits:
+            summary_parts.append("Latest screening averages: " + ", ".join(score_bits) + ".")
+
+    if flagged_user_count > 0:
+        summary_parts.append(
+            f"{flagged_user_count} user(s) currently meet elevated screening thresholds and may benefit from additional follow-up support."
+        )
+    else:
+        summary_parts.append("No users currently exceed elevated screening thresholds based on available questionnaire entries.")
+
+    return " ".join(summary_parts).strip()
+
+
+def _normalize_questionnaire_answers(questionnaire_type: str, answers: List[int]) -> List[int]:
+    definition = QUESTIONNAIRE_DEFINITIONS.get(questionnaire_type, {})
+    question_count = len(definition.get("questions", []))
+    max_per_item = 4 if questionnaire_type == "PCL-5" else 3
+
+    normalized: List[int] = []
+    for index in range(question_count):
+        raw = answers[index] if index < len(answers) else 0
+        try:
+            value = int(raw)
+        except Exception:
+            value = 0
+        value = max(0, min(max_per_item, value))
+        normalized.append(value)
+
+    return normalized
 
 
 def _ensure_whisper_runtime_sync() -> Optional[str]:
@@ -282,12 +456,15 @@ async def serenity_lifespan(fastapi_app: FastAPI):
     else:
         LOGGER.info("Whisper preload disabled: STT model will load on first transcription request.")
 
-    try:
-        fastapi_app.state.cloud_llm_client = CloudLLMClient()
-        LOGGER.info("Cloud LLM API client initialized successfully")
-    except CloudLLMError as exc:
-        fastapi_app.state.rag_init_error = str(exc)
-        LOGGER.warning("Cloud LLM client initialization failed: %s", exc)
+    if CLOUD_LLM_LAZY_INIT:
+        LOGGER.info("Cloud LLM lazy init enabled: client will initialize on first chat request.")
+    else:
+        try:
+            fastapi_app.state.cloud_llm_client = CloudLLMClient()
+            LOGGER.info("Cloud LLM API client initialized successfully")
+        except CloudLLMError as exc:
+            fastapi_app.state.rag_init_error = str(exc)
+            LOGGER.warning("Cloud LLM client initialization failed: %s", exc)
 
     if CLOUD_LLM_WARMUP_ENABLED and fastapi_app.state.cloud_llm_client is not None:
         fastapi_app.state.cloud_llm_warmup_task = asyncio.create_task(_warmup_cloud_llm_once())
@@ -394,6 +571,222 @@ async def login(payload: AuthRequest) -> AuthResponse:
         raise HTTPException(status_code=500, detail="Login failed") from exc
     finally:
         db.close()
+
+
+@app.get("/api/questionnaires/templates")
+async def get_questionnaire_templates(types: Optional[str] = None) -> Dict[str, object]:
+    requested_types: Optional[List[str]] = None
+    if types:
+        requested_types = [item.strip() for item in types.split(",") if item.strip()]
+
+    templates = questionnaire_templates(requested_types)
+    return {
+        "available_types": list(QUESTIONNAIRE_DEFINITIONS.keys()),
+        "questionnaires": templates,
+    }
+
+
+@app.post("/api/questionnaires/submit")
+async def submit_questionnaire(payload: QuestionnaireSubmitRequest) -> Dict[str, object]:
+    username = str(payload.username or "").strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="Username is required")
+
+    questionnaire_type = normalize_questionnaire_type(payload.questionnaire_type)
+    if questionnaire_type is None:
+        raise HTTPException(status_code=400, detail="Invalid questionnaire type")
+
+    normalized_answers = _normalize_questionnaire_answers(questionnaire_type, payload.answers)
+    total_score, severity = score_questionnaire(questionnaire_type, normalized_answers)
+    submitted_dt = _parse_optional_datetime(payload.submitted_at)
+
+    db = SessionLocal()
+    try:
+        record = persist_questionnaire_result(
+            db,
+            username=username,
+            questionnaire_type=questionnaire_type,
+            answers=normalized_answers,
+            total_score=total_score,
+            severity=severity,
+            created_at=submitted_dt,
+        )
+    except Exception as exc:
+        LOGGER.exception("Failed to persist questionnaire result: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to save questionnaire result") from exc
+    finally:
+        db.close()
+
+    return {
+        "message": "Questionnaire saved",
+        "result": {
+            "id": record.id,
+            "username": username,
+            "questionnaire_type": questionnaire_type,
+            "answers": normalized_answers,
+            "total_score": total_score,
+            "severity": severity,
+            "created_at": record.created_at.isoformat() if record.created_at else None,
+        },
+    }
+
+
+@app.get("/api/questionnaires/history")
+async def questionnaire_history(username: str, limit: int = 30) -> Dict[str, object]:
+    cleaned_username = str(username or "").strip()
+    if not cleaned_username:
+        raise HTTPException(status_code=400, detail="Username is required")
+
+    safe_limit = max(1, min(200, int(limit or 30)))
+
+    db = SessionLocal()
+    try:
+        rows = fetch_questionnaire_results(db, username=cleaned_username, limit=safe_limit)
+    except Exception as exc:
+        LOGGER.exception("Failed to fetch questionnaire history: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to fetch questionnaire history") from exc
+    finally:
+        db.close()
+
+    return {
+        "username": cleaned_username,
+        "results": rows,
+    }
+
+
+@app.get("/api/admin/overview")
+async def admin_overview(limit: Optional[int] = None) -> Dict[str, object]:
+
+    db = SessionLocal()
+    try:
+        total_users = int(db.query(func.count(models.User.id)).scalar() or 0)
+        total_conversation_turns = int(db.query(func.count(models.ConversationTurn.id)).scalar() or 0)
+        total_sessions = int(db.query(func.count(models.Session.id)).scalar() or 0)
+        total_emotion_events = int(db.query(func.count(models.Emotion.id)).scalar() or 0)
+        total_questionnaire_entries = int(db.query(func.count(models.QuestionnaireResult.id)).scalar() or 0)
+
+        if limit is None or int(limit) <= 0:
+            safe_limit = max(1, total_conversation_turns)
+            session_limit = max(1, total_sessions)
+            questionnaire_limit = max(1, total_questionnaire_entries)
+        else:
+            safe_limit = max(20, min(5000, int(limit)))
+            session_limit = max(20, min(5000, safe_limit))
+            questionnaire_limit = max(100, min(10000, safe_limit * 3))
+
+        conversation_turns = fetch_recent_turn_summaries(db, limit=safe_limit)
+        sessions = fetch_recent_sessions_with_emotions(db, limit=session_limit)
+        questionnaire_results = fetch_questionnaire_results(db, limit=questionnaire_limit)
+    except Exception as exc:
+        LOGGER.exception("Failed to build admin overview: %s", exc)
+        raise HTTPException(status_code=500, detail="Failed to build admin overview") from exc
+    finally:
+        db.close()
+
+    emotion_counts: Dict[str, int] = {}
+    for turn in conversation_turns:
+        label = _normalize_emotion_label(str(turn.get("dominant_emotion", "neutral")))
+        emotion_counts[label] = emotion_counts.get(label, 0) + 1
+
+    for session in sessions:
+        for emotion_item in session.get("emotions", []):
+            label = _normalize_emotion_label(str(emotion_item.get("emotion", "neutral")))
+            emotion_counts[label] = emotion_counts.get(label, 0) + 1
+
+    latest_by_user: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    latest_scores_by_type: Dict[str, List[int]] = {}
+    flagged_users: List[Dict[str, Any]] = []
+
+    for item in questionnaire_results:
+        username = str(item.get("username") or "unknown")
+        questionnaire_type = str(item.get("questionnaire_type") or "")
+        if not questionnaire_type:
+            continue
+
+        user_bucket = latest_by_user.setdefault(username, {})
+        if questionnaire_type in user_bucket:
+            continue
+        user_bucket[questionnaire_type] = item
+
+    for username, user_latest in latest_by_user.items():
+        score_map: Dict[str, int] = {}
+        for questionnaire_type, item in user_latest.items():
+            score = int(item.get("total_score") or 0)
+            score_map[questionnaire_type] = score
+            latest_scores_by_type.setdefault(questionnaire_type, []).append(score)
+
+        flags = questionnaire_clinical_flags(score_map)
+        if any(flags.values()):
+            flagged_users.append(
+                {
+                    "username": username,
+                    "scores": score_map,
+                    "flags": flags,
+                }
+            )
+
+    top_emotions = [
+        {"emotion": emotion, "count": count}
+        for emotion, count in sorted(emotion_counts.items(), key=lambda pair: pair[1], reverse=True)
+    ]
+
+    summary = _build_admin_summary(
+        total_users=total_users,
+        emotion_counts=emotion_counts,
+        latest_scores_by_type=latest_scores_by_type,
+        flagged_user_count=len(flagged_users),
+    )
+
+    metrics = [
+        {
+            "id": "users",
+            "label": "Registered Users",
+            "value": total_users,
+            "description": "Accounts in local database",
+        },
+        {
+            "id": "turns",
+            "label": "Conversation Turns",
+            "value": total_conversation_turns,
+            "description": "Stored user-assistant exchanges",
+        },
+        {
+            "id": "sessions",
+            "label": "Sessions",
+            "value": total_sessions,
+            "description": "Legacy session records",
+        },
+        {
+            "id": "emotion_events",
+            "label": "Emotion Events",
+            "value": total_emotion_events,
+            "description": "Session-level emotion rows",
+        },
+        {
+            "id": "questionnaires",
+            "label": "Questionnaire Entries",
+            "value": total_questionnaire_entries,
+            "description": "Saved PHQ-9, GAD-7, and PCL-5 submissions",
+        },
+        {
+            "id": "flagged_users",
+            "label": "Elevated Screens",
+            "value": len(flagged_users),
+            "description": "Users with latest scores above screening thresholds",
+        },
+    ]
+
+    return {
+        "generated_at": datetime.utcnow().isoformat(),
+        "summary": summary,
+        "metrics": metrics,
+        "top_emotions": top_emotions,
+        "chats": conversation_turns,
+        "sessions": sessions,
+        "questionnaire_results": questionnaire_results,
+        "latest_questionnaires_by_user": latest_by_user,
+        "flagged_users": flagged_users,
+    }
 
 
 # --- HEALTH & EMOTION ENDPOINTS ---
@@ -981,6 +1374,11 @@ async def _generate_llm_response(
 ) -> tuple[str, Optional[str], List[str], List[str]]:
     cloud_llm_client = _state_get("cloud_llm_client")
     if cloud_llm_client is None:
+        cloud_llm_client, init_error = await _ensure_cloud_llm_client()
+    else:
+        init_error = None
+
+    if cloud_llm_client is None:
         init_error = _state_get("rag_init_error")
         error_msg = "Cloud LLM client unavailable"
         if init_error:
@@ -1032,7 +1430,12 @@ async def _stream_multimodal_generation(
     emotion_probabilities: Optional[Dict[str, Dict[str, float]]] = None,
 ):
     cloud_llm_client = _state_get("cloud_llm_client")
-    init_error = _state_get("rag_init_error")
+    init_error = None
+
+    if cloud_llm_client is None:
+        cloud_llm_client, init_error = await _ensure_cloud_llm_client()
+    if cloud_llm_client is None and init_error is None:
+        init_error = _state_get("rag_init_error")
 
     if cloud_llm_client is None:
         errors = ["Cloud LLM client unavailable"]

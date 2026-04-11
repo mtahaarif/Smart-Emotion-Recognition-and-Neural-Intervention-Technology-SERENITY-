@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime
+from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, Text
 from sqlalchemy.orm import relationship
 from datetime import datetime
 
@@ -14,6 +14,11 @@ class User(Base):
     password = Column(String)
     sessions = relationship("Session", back_populates="user")
     turns = relationship("ConversationTurn", back_populates="user", cascade="all, delete-orphan")
+    questionnaire_results = relationship(
+        "QuestionnaireResult",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
 
 class Session(Base):
     __tablename__ = "sessions"
@@ -47,3 +52,17 @@ class ConversationTurn(Base):
     timestamp = Column(DateTime, default=datetime.utcnow, index=True)
 
     user = relationship("User", back_populates="turns")
+
+
+class QuestionnaireResult(Base):
+    __tablename__ = "questionnaire_results"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    questionnaire_type = Column(String, nullable=False, index=True)
+    answers_json = Column(Text, nullable=False)
+    total_score = Column(Integer, nullable=False)
+    severity = Column(String, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    user = relationship("User", back_populates="questionnaire_results")
