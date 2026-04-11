@@ -113,6 +113,14 @@ PROMPT_LEAK_PATTERNS = [
     re.compile(r"\bReflecting\s*feelings?\b.*$", flags=re.IGNORECASE),
     re.compile(r"\bthen asking(?:\s+one)?\s+follow-?up\s+question\b.*$", flags=re.IGNORECASE),
     re.compile(r"\bdialogue while reflecting on personal responses\.?", flags=re.IGNORECASE),
+    re.compile(
+        r"\bserenity\s*is\s*an\s*empathetic\s*therapist\b.*$",
+        flags=re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r"\bthis\s*dialogue\s*should\s*only\s*be\s*used\s*as\s*a\s*general\s*conversation\s*starter\b.*$",
+        flags=re.IGNORECASE | re.DOTALL,
+    ),
 ]
 GLUED_ALPHA_RUN_REGEX = re.compile(r"[A-Za-z]{12,}")
 
@@ -650,6 +658,11 @@ def _strip_prompt_leakage(text: str) -> str:
     return cleaned
 
 
+def _remove_disallowed_tail(text: str) -> str:
+    """Remove fixed policy/disclaimer tails that should not reach UI or TTS."""
+    return _strip_prompt_leakage(text)
+
+
 def _collapse_repeated_ngrams(text: str) -> str:
     cleaned = str(text or "")
     if not cleaned:
@@ -718,6 +731,8 @@ def _sanitize_cloud_llm_response(text: str, max_words: int = 60) -> str:
     if TRUST_CLOUD_POLISHED_RESPONSE:
         cleaned = _extract_text_from_cloud_blob(str(text or "")) or str(text or "")
         cleaned = _normalize_polished_cloud_text(cleaned)
+        cleaned = _strip_starred_segments(cleaned, preserve_edges=True)
+        cleaned = _remove_disallowed_tail(cleaned)
         cleaned = _strip_prompt_leakage(cleaned)
         cleaned = _collapse_repeated_ngrams(cleaned)
         cleaned = _dedupe_sentences(cleaned, max_sentences=3)
@@ -758,6 +773,7 @@ def _sanitize_cloud_llm_response(text: str, max_words: int = 60) -> str:
                 cleaned = escaped_value.replace("\\n", "\n").replace('\\"', '"')
             cleaned = _hard_clean_text(cleaned)
 
+    cleaned = _remove_disallowed_tail(cleaned)
     cleaned = _strip_prompt_leakage(cleaned)
 
     # Normalize whitespace and strip markdown artifacts.
@@ -1204,17 +1220,39 @@ async def _stream_multimodal_generation(
                 if not clean_piece:
                     continue
 
-                display_text += clean_piece
+                candidate_text = _remove_disallowed_tail(display_text + clean_piece)
+                if candidate_text == display_text:
+                    continue
+
+                # Tail stripping can retract already-shown provisional text; emit replace
+                # so UI/TTS state remains aligned with the sanitized transcript.
+                if not candidate_text.startswith(display_text):
+                    display_text = candidate_text
+                    if emit_provisional_text:
+                        yield {
+                            "type": "assistant_replace",
+                            "text": display_text,
+                        }
+                        emitted = True
+                    if stream_sentence_tts_live:
+                        sentence_stream_buffer = ""
+                    continue
+
+                delta_piece = candidate_text[len(display_text):]
+                if not delta_piece:
+                    continue
+
+                display_text = candidate_text
                 if emit_provisional_text:
                     yield {
                         "type": "assistant_delta",
-                        "delta": clean_piece,
+                        "delta": delta_piece,
                         "text": display_text,
                     }
                     emitted = True
 
                 if stream_sentence_tts_live:
-                    sentence_stream_buffer += clean_piece
+                    sentence_stream_buffer += delta_piece
                     completed_sentences, sentence_stream_buffer = _drain_complete_sentences(sentence_stream_buffer)
                     for sentence_text in completed_sentences:
                         registered = _register_sentence(sentence_text)

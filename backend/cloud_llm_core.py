@@ -140,7 +140,7 @@ class CloudLLMClient:
 
     def _normalize_chunk(self, text: str, preserve_edges: bool = False) -> str:
         if self.trust_polished_response:
-            normalized = str(text or "").replace("\r", "")
+            normalized = self._strip_starred_segments(str(text or ""), preserve_edges=True).replace("\r", "")
             normalized = re.sub(r"[ \t]+", " ", normalized)
             return normalized if preserve_edges else normalized.strip()
 
