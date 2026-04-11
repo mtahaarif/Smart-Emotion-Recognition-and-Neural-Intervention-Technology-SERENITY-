@@ -20,6 +20,7 @@ DEFAULT_TFLITE_THREADS = max(1, (os.cpu_count() or 4) // 2)
 SER_AUDIO_SAMPLE_RATE = int(os.getenv("SERENITY_SER_AUDIO_SAMPLE_RATE", "16000"))
 SER_AUDIO_DURATION_SECONDS = float(os.getenv("SERENITY_SER_AUDIO_DURATION_SECONDS", "3"))
 SER_AUDIO_OFFSET_SECONDS = float(os.getenv("SERENITY_SER_AUDIO_OFFSET_SECONDS", "0.5"))
+SER_AUDIO_RESAMPLE_TYPE = os.getenv("SERENITY_SER_AUDIO_RESAMPLE_TYPE", "polyphase").strip() or "polyphase"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -148,14 +149,32 @@ def predict_audio_emotion(file_path: str, runtime: Optional[Dict[str, Any]] = No
     labels = active_runtime["labels"]
 
     try:
-        y, sr = librosa.load(
-            file_path,
-            sr=SER_AUDIO_SAMPLE_RATE,
-            mono=True,
-            duration=SER_AUDIO_DURATION_SECONDS,
-            offset=SER_AUDIO_OFFSET_SECONDS,
-            res_type="kaiser_fast",
-        )
+        try:
+            y, sr = librosa.load(
+                file_path,
+                sr=SER_AUDIO_SAMPLE_RATE,
+                mono=True,
+                duration=SER_AUDIO_DURATION_SECONDS,
+                offset=SER_AUDIO_OFFSET_SECONDS,
+                res_type=SER_AUDIO_RESAMPLE_TYPE,
+            )
+        except ModuleNotFoundError as exc:
+            if exc.name != "resampy":
+                raise
+
+            LOGGER.warning(
+                "SER resampler '%s' requires resampy, retrying with scipy polyphase.",
+                SER_AUDIO_RESAMPLE_TYPE,
+            )
+            y, sr = librosa.load(
+                file_path,
+                sr=SER_AUDIO_SAMPLE_RATE,
+                mono=True,
+                duration=SER_AUDIO_DURATION_SECONDS,
+                offset=SER_AUDIO_OFFSET_SECONDS,
+                res_type="polyphase",
+            )
+
         if y.size == 0:
             return _safe_result(error="Audio input was empty after decoding")
         features = _prepare_features(y=y, sr=sr, model_shape=input_details[0]["shape"])
