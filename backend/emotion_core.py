@@ -17,6 +17,11 @@ BASE_DIR = os.path.dirname(__file__)
 MODEL_PATH = os.path.join(BASE_DIR, "fer_model.tflite")
 DEFAULT_EMOTIONS = ["Angry", "Disgust", "Fear", "Happy", "Neutral", "Sad", "Surprise"]
 
+DEFAULT_TFLITE_THREADS = max(1, (os.cpu_count() or 4) // 2)
+FER_MAX_FRAME_SIDE = int(os.getenv("SERENITY_FER_MAX_FRAME_SIDE", "640"))
+FER_FACE_SCALE_FACTOR = float(os.getenv("SERENITY_FER_FACE_SCALE_FACTOR", "1.2"))
+FER_FACE_MIN_NEIGHBORS = int(os.getenv("SERENITY_FER_FACE_MIN_NEIGHBORS", "5"))
+
 LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_RUNTIME: Optional[Dict[str, Any]] = None
@@ -74,7 +79,12 @@ def initialize_face_runtime(
         raise FileNotFoundError(f"FER model not found at {model_path}")
 
     if num_threads is None:
-        num_threads = int(os.getenv("SERENITY_TFLITE_THREADS", str(max(1, (os.cpu_count() or 4) - 1))))
+        num_threads = int(
+            os.getenv(
+                "SERENITY_FER_TFLITE_THREADS",
+                os.getenv("SERENITY_TFLITE_THREADS", str(DEFAULT_TFLITE_THREADS)),
+            )
+        )
 
     interpreter, delegate = _build_interpreter(model_path=model_path, num_threads=num_threads)
     face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
@@ -118,8 +128,24 @@ def analyze_face(image_data: str, runtime: Optional[Dict[str, Any]] = None) -> D
         if frame is None:
             return _safe_result(error="Invalid frame data")
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+        detection_frame = frame
+        if FER_MAX_FRAME_SIDE > 0:
+            frame_height, frame_width = frame.shape[:2]
+            longest_side = max(frame_height, frame_width)
+            if longest_side > FER_MAX_FRAME_SIDE:
+                scale = FER_MAX_FRAME_SIDE / float(longest_side)
+                detection_frame = cv2.resize(
+                    frame,
+                    (max(1, int(frame_width * scale)), max(1, int(frame_height * scale))),
+                    interpolation=cv2.INTER_AREA,
+                )
+
+        gray = cv2.cvtColor(detection_frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(
+            gray,
+            FER_FACE_SCALE_FACTOR,
+            FER_FACE_MIN_NEIGHBORS,
+        )
         if len(faces) == 0:
             return _safe_result(emotion="No Face", confidence=0.0)
 

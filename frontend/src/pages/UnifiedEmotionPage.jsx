@@ -23,62 +23,29 @@ const stripStarredSegments = (value, preserveEdges = false) => {
     return '';
   }
 
-  let inStarredSegment = false;
-  let index = 0;
-  const output = [];
-
-  while (index < source.length) {
-    if (source[index] === '*') {
-      while (index < source.length && source[index] === '*') {
-        index += 1;
-      }
-      inStarredSegment = !inStarredSegment;
-      continue;
-    }
-
-    if (!inStarredSegment) {
-      output.push(source[index]);
-    }
-    index += 1;
-  }
-
-  const cleaned = output
-    .join('')
+  const starIndex = source.indexOf('*');
+  const cleaned = (starIndex === -1 ? source : source.slice(0, starIndex))
     .replace(/[ \t]+/g, ' ')
     .replace(/\s+([,.;:!?])/g, '$1');
   return preserveEdges ? cleaned : cleaned.trim();
 };
 
-const cleanStreamToken = (token, inStarredSegment) => {
+const cleanStreamToken = (token, reachedFirstAsterisk) => {
+  if (reachedFirstAsterisk) {
+    return { cleanToken: '', reachedFirstAsterisk: true };
+  }
+
   const source = String(token || '');
   if (!source) {
-    return { cleanToken: '', inStarredSegment };
+    return { cleanToken: '', reachedFirstAsterisk: false };
   }
 
-  const output = [];
-  let index = 0;
-
-  while (index < source.length) {
-    const char = source[index];
-    if (char === '*') {
-      while (index < source.length && source[index] === '*') {
-        index += 1;
-      }
-      inStarredSegment = !inStarredSegment;
-      continue;
-    }
-
-    if (!inStarredSegment) {
-      output.push(char);
-    }
-    index += 1;
-  }
-
-  const cleanToken = output
-    .join('')
+  const starIndex = source.indexOf('*');
+  const visible = starIndex === -1 ? source : source.slice(0, starIndex);
+  const cleanToken = visible
     .replace(/[ \t]+/g, ' ')
     .replace(/\s+([,.;:!?])/g, '$1');
-  return { cleanToken, inStarredSegment };
+  return { cleanToken, reachedFirstAsterisk: starIndex !== -1 };
 };
 
 const hardClean = (value, preserveEdges = false) => {
@@ -104,7 +71,7 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
   const streamUiFrameRef = useRef(null);
   const streamUiPendingTextRef = useRef('');
   const streamUiPendingTurnRef = useRef(null);
-  const streamInStarredSegmentRef = useRef(false);
+  const streamReachedFirstAsteriskRef = useRef(false);
 
   const [cameraEnabled, setCameraEnabled] = useState(false);
   const [isCameraOn, setIsCameraOn] = useState(false);
@@ -640,7 +607,7 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
     let provisionalEmotion = '';
 
     resetStreamAudioPlayback();
-    streamInStarredSegmentRef.current = false;
+    streamReachedFirstAsteriskRef.current = false;
 
     await streamNdjson({
       url: `${API_BASE_URL}/api/interact/stream`,
@@ -729,12 +696,13 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
             }
           }
 
-          const { cleanToken, inStarredSegment } = cleanStreamToken(rawToken, streamInStarredSegmentRef.current);
-          streamInStarredSegmentRef.current = inStarredSegment;
+          const { cleanToken, reachedFirstAsterisk } = cleanStreamToken(rawToken, streamReachedFirstAsteriskRef.current);
+          streamReachedFirstAsteriskRef.current = reachedFirstAsterisk;
           if (!cleanToken) {
             return;
           }
 
+          const isFirstVisibleToken = !liveAssistantText;
           liveAssistantText += cleanToken;
           if (SHOW_PROVISIONAL_ASSISTANT_TEXT) {
             if (!turnId) {
@@ -745,14 +713,20 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
                 source: 'voice',
               });
             }
-            scheduleStreamUiUpdate(liveAssistantText, turnId);
+            if (isFirstVisibleToken) {
+              cancelStreamUiUpdate();
+              setAssistantText(liveAssistantText);
+              updateConversationTurn(turnId, { assistantReply: liveAssistantText });
+            } else {
+              scheduleStreamUiUpdate(liveAssistantText, turnId);
+            }
           }
           return;
         }
 
         if (eventType === 'assistant_replace') {
           liveAssistantText = hardClean(String(event?.text || liveAssistantText));
-          streamInStarredSegmentRef.current = false;
+          streamReachedFirstAsteriskRef.current = false;
           if (liveAssistantText) {
             cancelStreamUiUpdate();
             setAssistantText(liveAssistantText);
@@ -795,7 +769,7 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
 
         if (eventType === 'final') {
           const finalReply = hardClean(event?.llm_response || liveAssistantText || '');
-          streamInStarredSegmentRef.current = false;
+          streamReachedFirstAsteriskRef.current = false;
           const finalText = String(event?.transcription || textFallback || '').trim();
           setDominantEmotion(String(event?.dominant_emotion || 'Neutral'));
           setSpeechEmotion(String(event?.speech_emotion || 'Neutral'));
@@ -835,7 +809,7 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
     setTranscription('');
     cancelStreamUiUpdate();
     setAssistantText('');
-    streamInStarredSegmentRef.current = false;
+    streamReachedFirstAsteriskRef.current = false;
     streamAudioQueueRef.current = [];
     streamAudioActiveRef.current = false;
     if (streamAudioElementRef.current) {
@@ -850,7 +824,7 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
     setSessionActive(false);
     setIsRecording(false);
     setIsProcessing(false);
-    streamInStarredSegmentRef.current = false;
+    streamReachedFirstAsteriskRef.current = false;
     cancelStreamUiUpdate();
     streamAudioQueueRef.current = [];
     streamAudioActiveRef.current = false;
@@ -1035,6 +1009,7 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
 
   const sendTextPrompt = async () => {
     const message = promptText.trim();
+    let turnId = null;
 
     if (!sessionActive) {
       pushNotice('Start a session first to send a message.');
@@ -1050,7 +1025,7 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
     setStatusText('Sending your message to SERENITY...');
 
     try {
-      let turnId = appendConversationTurn({
+      turnId = appendConversationTurn({
         userText: message,
         assistantReply: '',
         emotion: dominantEmotion,
@@ -1059,7 +1034,7 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
       let liveAssistantText = '';
 
       resetStreamAudioPlayback();
-      streamInStarredSegmentRef.current = false;
+      streamReachedFirstAsteriskRef.current = false;
 
       await streamNdjson({
         url: `${API_BASE_URL}/api/chat/stream`,
@@ -1093,22 +1068,29 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
               }
             }
 
-            const { cleanToken, inStarredSegment } = cleanStreamToken(rawToken, streamInStarredSegmentRef.current);
-            streamInStarredSegmentRef.current = inStarredSegment;
+            const { cleanToken, reachedFirstAsterisk } = cleanStreamToken(rawToken, streamReachedFirstAsteriskRef.current);
+            streamReachedFirstAsteriskRef.current = reachedFirstAsterisk;
             if (!cleanToken) {
               return;
             }
 
+            const isFirstVisibleToken = !liveAssistantText;
             liveAssistantText += cleanToken;
             if (SHOW_PROVISIONAL_ASSISTANT_TEXT) {
-              scheduleStreamUiUpdate(liveAssistantText, turnId);
+              if (isFirstVisibleToken) {
+                cancelStreamUiUpdate();
+                setAssistantText(liveAssistantText);
+                updateConversationTurn(turnId, { assistantReply: liveAssistantText });
+              } else {
+                scheduleStreamUiUpdate(liveAssistantText, turnId);
+              }
             }
             return;
           }
 
           if (eventType === 'assistant_replace') {
             liveAssistantText = hardClean(String(event?.text || liveAssistantText));
-            streamInStarredSegmentRef.current = false;
+            streamReachedFirstAsteriskRef.current = false;
             if (liveAssistantText) {
               cancelStreamUiUpdate();
               setAssistantText(liveAssistantText);
@@ -1148,7 +1130,7 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
 
           if (eventType === 'final') {
             const finalReply = hardClean(event?.llm_response || liveAssistantText || '');
-            streamInStarredSegmentRef.current = false;
+            streamReachedFirstAsteriskRef.current = false;
             cancelStreamUiUpdate();
             setTranscription(message);
             setAssistantText(finalReply);

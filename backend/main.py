@@ -53,11 +53,6 @@ try:
 except ImportError:
     edge_tts = None
 
-try:
-    import wordninja
-except ImportError:
-    wordninja = None
-
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -100,14 +95,11 @@ EMOTION_ALIAS = {
     "no face": "neutral",
 }
 SENTENCE_BOUNDARY_REGEX = re.compile(r"(?<=[.!?])\s+")
+SENTENCE_TERMINATOR_REGEX = re.compile(r"[.!?][\"')\]]*$")
 CAMEL_BOUNDARY_REGEX = re.compile(r"([a-z])([A-Z])")
 WHITESPACE_REGEX = re.compile(r"\s+")
-HARD_CLEAN_PATTERNS = [
-    re.compile(r"\*(?:Reflects\s*feelings|Reflectsfeelings)\*", flags=re.IGNORECASE),
-    re.compile(r"\*(?:Asks\s*follow-?up\s*question|Asksfollow-?upquestion)\*", flags=re.IGNORECASE),
-    re.compile(r"Reflecting feelings, then asking ONE follow-up question\.?", flags=re.IGNORECASE),
-    re.compile(r"\bUser:|\bAssistant:", flags=re.IGNORECASE),
-]
+HORIZONTAL_SPACE_REGEX = re.compile(r"[ \t]+")
+SPACE_BEFORE_PUNCT_REGEX = re.compile(r"\s+([,.;:!?])")
 PROMPT_LEAK_PATTERNS = [
     re.compile(r"Reflecting feelings, then asking ONE follow-up question\.?", flags=re.IGNORECASE),
     re.compile(r"\bReflecting\s*feelings?\b.*$", flags=re.IGNORECASE),
@@ -122,7 +114,6 @@ PROMPT_LEAK_PATTERNS = [
         flags=re.IGNORECASE | re.DOTALL,
     ),
 ]
-GLUED_ALPHA_RUN_REGEX = re.compile(r"[A-Za-z]{12,}")
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -134,7 +125,12 @@ LAZY_RUNTIME_INIT = _env_bool("SERENITY_LAZY_RUNTIME_INIT", EDGE_OPTIMIZED_MODE)
 WHISPER_PRELOAD_ENABLED = _env_bool("SERENITY_WHISPER_PRELOAD_ENABLED", not EDGE_OPTIMIZED_MODE)
 
 WHISPER_MODEL_SIZE = os.getenv("SERENITY_WHISPER_MODEL_SIZE", "tiny").strip()
-WHISPER_CPU_THREADS = int(os.getenv("SERENITY_WHISPER_CPU_THREADS", str(max(1, (os.cpu_count() or 4) - 1))))
+DEFAULT_WHISPER_CPU_THREADS = (
+    max(1, (os.cpu_count() or 4) // 2)
+    if EDGE_OPTIMIZED_MODE
+    else max(1, (os.cpu_count() or 4) - 1)
+)
+WHISPER_CPU_THREADS = int(os.getenv("SERENITY_WHISPER_CPU_THREADS", str(DEFAULT_WHISPER_CPU_THREADS)))
 WHISPER_COMPUTE_TYPE_CPU = os.getenv("SERENITY_WHISPER_COMPUTE_TYPE_CPU", "int8").strip()
 REQUIRE_STT_BACKEND = _env_bool("SERENITY_REQUIRE_STT_BACKEND", False)
 WHISPER_TIMEOUT_SECONDS = int(os.getenv("SERENITY_WHISPER_TIMEOUT_SECONDS", "40"))
@@ -150,13 +146,21 @@ TTS_PITCH = os.getenv("SERENITY_TTS_PITCH", "+0Hz").strip()
 TTS_STREAMING_ENABLED = _env_bool("SERENITY_TTS_STREAMING_ENABLED", True)
 TTS_WARMUP_ENABLED = _env_bool("SERENITY_TTS_WARMUP_ENABLED", not EDGE_OPTIMIZED_MODE)
 STREAM_TOKEN_DELTA = _env_bool("SERENITY_STREAM_TOKEN_DELTA", True)
-STREAM_PROVISIONAL_TEXT = _env_bool("SERENITY_STREAM_PROVISIONAL_TEXT", True)
 STREAM_TTS_SENTENCE_AUDIO = _env_bool("SERENITY_STREAM_TTS_SENTENCE_AUDIO", True)
 STREAM_TTS_FINAL_TEXT_ONLY = _env_bool("SERENITY_STREAM_TTS_FINAL_TEXT_ONLY", False)
 TRUST_CLOUD_POLISHED_RESPONSE = _env_bool("SERENITY_TRUST_CLOUD_POLISHED_RESPONSE", True)
 CLOUD_LLM_WARMUP_ENABLED = _env_bool("SERENITY_CLOUD_LLM_WARMUP_ENABLED", not EDGE_OPTIMIZED_MODE)
 CLOUD_LLM_WARMUP_TEXT = os.getenv("SERENITY_CLOUD_LLM_WARMUP_TEXT", "Hello").strip() or "Hello"
 CLOUD_LLM_WARMUP_TIMEOUT_SECONDS = int(os.getenv("SERENITY_CLOUD_LLM_WARMUP_TIMEOUT_SECONDS", "45"))
+
+_stream_queue_wait_default = "0.015" if EDGE_OPTIMIZED_MODE else "0.01"
+try:
+    STREAM_QUEUE_WAIT_SECONDS = max(
+        0.001,
+        float(os.getenv("SERENITY_STREAM_QUEUE_WAIT_SECONDS", _stream_queue_wait_default).strip()),
+    )
+except ValueError:
+    STREAM_QUEUE_WAIT_SECONDS = 0.015 if EDGE_OPTIMIZED_MODE else 0.01
 
 llm_generation_semaphore = asyncio.Semaphore(1)
 tts_consecutive_failures = 0
@@ -453,27 +457,6 @@ def _serialize_turns(turns: list) -> List[Dict[str, str]]:
         )
     return history
 
-
-async def _consume_streaming_tts(
-    sentence_queue: "asyncio.Queue[Optional[str]]",
-) -> tuple[List[str], List[str]]:
-    audio_segments: List[str] = []
-    tts_errors: List[str] = []
-
-    while True:
-        sentence = await sentence_queue.get()
-        if sentence is None:
-            break
-
-        encoded_audio, tts_error = await _generate_tts_base64(sentence)
-        if encoded_audio:
-            audio_segments.append(encoded_audio)
-        if tts_error:
-            tts_errors.append(tts_error)
-
-    return audio_segments, tts_errors
-
-
 def _to_ndjson_event(payload: Dict[str, object]) -> str:
     return json.dumps(payload, ensure_ascii=False) + "\n"
 
@@ -535,26 +518,10 @@ def _strip_starred_segments(text: str, preserve_edges: bool = False) -> str:
     if not source:
         return ""
 
-    output_chars: List[str] = []
-    in_starred_segment = False
-    index = 0
-    length = len(source)
-
-    while index < length:
-        char = source[index]
-        if char == "*":
-            while index < length and source[index] == "*":
-                index += 1
-            in_starred_segment = not in_starred_segment
-            continue
-
-        if not in_starred_segment:
-            output_chars.append(char)
-        index += 1
-
-    cleaned = "".join(output_chars)
-    cleaned = re.sub(r"[ \t]+", " ", cleaned)
-    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    star_index = source.find("*")
+    cleaned = source if star_index == -1 else source[:star_index]
+    cleaned = HORIZONTAL_SPACE_REGEX.sub(" ", cleaned)
+    cleaned = SPACE_BEFORE_PUNCT_REGEX.sub(r"\1", cleaned)
     return cleaned if preserve_edges else cleaned.strip()
 
 
@@ -564,36 +531,28 @@ def _hard_clean_text(text: str, preserve_edges: bool = False) -> str:
         return ""
 
     # Match the same hard-clean style used by the standalone stream client.
-    cleaned = re.sub(r"([a-z])([A-Z])", r"\1 \2", cleaned)
+    cleaned = CAMEL_BOUNDARY_REGEX.sub(r"\1 \2", cleaned)
     cleaned = WHITESPACE_REGEX.sub(" ", cleaned)
     return cleaned if preserve_edges else cleaned.strip()
 
 
-def _clean_stream_token(token: str, in_starred_segment: bool) -> tuple[str, bool]:
+def _clean_stream_token(token: str, reached_first_asterisk: bool) -> tuple[str, bool]:
     source = str(token or "")
     if not source:
-        return "", in_starred_segment
+        return "", reached_first_asterisk
 
-    output_chars: List[str] = []
-    index = 0
-    length = len(source)
+    if reached_first_asterisk:
+        return "", True
 
-    while index < length:
-        char = source[index]
-        if char == "*":
-            while index < length and source[index] == "*":
-                index += 1
-            in_starred_segment = not in_starred_segment
-            continue
+    star_index = source.find("*")
+    if star_index != -1:
+        source = source[:star_index]
+        reached_first_asterisk = True
 
-        if not in_starred_segment:
-            output_chars.append(char)
-        index += 1
-
-    cleaned = "".join(output_chars)
-    cleaned = re.sub(r"[ \t]+", " ", cleaned)
-    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
-    return cleaned, in_starred_segment
+    cleaned = source
+    cleaned = HORIZONTAL_SPACE_REGEX.sub(" ", cleaned)
+    cleaned = SPACE_BEFORE_PUNCT_REGEX.sub(r"\1", cleaned)
+    return cleaned, reached_first_asterisk
 
 
 def _normalize_polished_cloud_text(text: str, preserve_edges: bool = False) -> str:
@@ -826,6 +785,15 @@ def _drain_complete_sentences(buffer: str) -> Tuple[List[str], str]:
 
     segments = SENTENCE_BOUNDARY_REGEX.split(buffer)
     if len(segments) <= 1:
+        stripped_buffer = buffer.strip()
+        # Trigger sentence-TTS as soon as a sentence-ending punctuation arrives,
+        # even if the model has not emitted trailing whitespace yet.
+        if (
+            stripped_buffer
+            and SENTENCE_TERMINATOR_REGEX.search(stripped_buffer)
+            and len(stripped_buffer.split()) >= 3
+        ):
+            return [stripped_buffer], ""
         return [], buffer
 
     completed = [segment.strip() for segment in segments[:-1] if segment.strip()]
@@ -1090,17 +1058,29 @@ async def _stream_multimodal_generation(
         and edge_tts is not None
     )
     stream_sentence_tts_live = stream_sentence_tts_enabled and not STREAM_TTS_FINAL_TEXT_ONLY
-    emit_provisional_text = STREAM_PROVISIONAL_TEXT and STREAM_TOKEN_DELTA
+    emit_provisional_text = True
 
     def _producer() -> str:
         full_text_parts: List[str] = []
         try:
-            for chunk in cloud_llm_client.stream_serenity(user_text):
-                piece = str(chunk or "")
-                if not piece:
-                    continue
-                full_text_parts.append(piece)
-                loop.call_soon_threadsafe(chunk_queue.put_nowait, piece)
+            try:
+                for chunk in cloud_llm_client.stream_serenity(user_text):
+                    piece = str(chunk or "")
+                    if not piece:
+                        continue
+                    full_text_parts.append(piece)
+                    loop.call_soon_threadsafe(chunk_queue.put_nowait, piece)
+            except CloudLLMError as stream_exc:
+                # Retry once using non-stream generation when streaming endpoint
+                # is temporarily unavailable.
+                LOGGER.warning(
+                    "Cloud stream failed, retrying non-stream response: %s",
+                    _compact_cloud_error(stream_exc),
+                )
+                fallback_text = str(cloud_llm_client.ask_serenity(user_text) or "")
+                if fallback_text:
+                    full_text_parts.append(fallback_text)
+                    loop.call_soon_threadsafe(chunk_queue.put_nowait, fallback_text)
         finally:
             loop.call_soon_threadsafe(chunk_queue.put_nowait, None)
         return "".join(full_text_parts)
@@ -1117,7 +1097,7 @@ async def _stream_multimodal_generation(
     raw_stream_text = ""
     display_text = ""
     sentence_stream_buffer = ""
-    in_starred_segment = False
+    reached_first_asterisk = False
     final_response = ""
     sentence_sequence = 0
     sentence_key_to_sequence: Dict[str, int] = {}
@@ -1203,9 +1183,21 @@ async def _stream_multimodal_generation(
     try:
         while True:
             emitted = False
+            pending_pieces: List[Optional[str]] = []
 
-            while not chunk_queue.empty():
-                piece = chunk_queue.get_nowait()
+            if chunk_queue.empty() and not producer_done and not generation_task.done():
+                try:
+                    pending_pieces.append(
+                        await asyncio.wait_for(
+                        chunk_queue.get(),
+                        timeout=STREAM_QUEUE_WAIT_SECONDS,
+                        )
+                    )
+                except asyncio.TimeoutError:
+                    pass
+
+            while pending_pieces or not chunk_queue.empty():
+                piece = pending_pieces.pop(0) if pending_pieces else chunk_queue.get_nowait()
                 if piece is None:
                     producer_done = True
                     continue
@@ -1216,7 +1208,7 @@ async def _stream_multimodal_generation(
 
                 raw_stream_text += piece
 
-                clean_piece, in_starred_segment = _clean_stream_token(piece, in_starred_segment)
+                clean_piece, reached_first_asterisk = _clean_stream_token(piece, reached_first_asterisk)
                 if not clean_piece:
                     continue
 
@@ -1281,7 +1273,7 @@ async def _stream_multimodal_generation(
                 break
 
             if not emitted:
-                await asyncio.sleep(0.01)
+                await asyncio.sleep(0.005)
 
         producer_final_text = str(await generation_task or "").strip()
         if not raw_stream_text:

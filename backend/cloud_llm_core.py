@@ -2,7 +2,7 @@ import os
 import json
 import re
 import time
-from typing import Any, Iterator
+from typing import Any, Iterator, List
 
 import requests
 
@@ -25,9 +25,23 @@ class CloudLLMClient:
     """
 
     def __init__(self) -> None:
-        self.api_url = os.getenv("SERENITY_CLOUD_LLM_URL", "http://16.171.3.197:8000/chat").strip()
-        if not self.api_url:
+        primary_api_url = os.getenv("SERENITY_CLOUD_LLM_URL", "http://16.171.3.197:8000/chat").strip()
+        if not primary_api_url:
             raise CloudLLMError("Missing SERENITY_CLOUD_LLM_URL for cloud LLM API endpoint")
+
+        fallback_urls_raw = os.getenv(
+            "SERENITY_CLOUD_LLM_FALLBACK_URLS",
+            "http://127.0.0.1:8000/chat",
+        ).strip()
+        fallback_urls = [item.strip() for item in fallback_urls_raw.split(",") if item.strip()]
+
+        self.api_urls: List[str] = []
+        for candidate in [primary_api_url, *fallback_urls]:
+            if candidate and candidate not in self.api_urls:
+                self.api_urls.append(candidate)
+
+        self.active_api_url_index = 0
+        self.api_url = self.api_urls[self.active_api_url_index]
 
         timeout_raw = os.getenv("SERENITY_CLOUD_LLM_TIMEOUT_SECONDS", "12").strip()
         try:
@@ -110,30 +124,48 @@ class CloudLLMClient:
             self._unavailable_until_epoch = time.time() + self.cooldown_seconds
             self._consecutive_failures = 0
 
+    def _ordered_api_urls(self) -> List[str]:
+        if not self.api_urls:
+            return []
+
+        index = max(0, min(self.active_api_url_index, len(self.api_urls) - 1))
+        return self.api_urls[index:] + self.api_urls[:index]
+
+    def _set_active_api_url(self, url: str) -> None:
+        if not url:
+            return
+
+        try:
+            index = self.api_urls.index(url)
+        except ValueError:
+            return
+
+        self.active_api_url_index = index
+        self.api_url = self.api_urls[index]
+
+    @staticmethod
+    def _truncate_after_first_asterisk(text: str, reached_first_asterisk: bool) -> tuple[str, bool]:
+        if reached_first_asterisk:
+            return "", True
+
+        source = str(text or "")
+        if not source:
+            return "", False
+
+        star_index = source.find("*")
+        if star_index == -1:
+            return source, False
+
+        return source[:star_index], True
+
     @staticmethod
     def _strip_starred_segments(text: str, preserve_edges: bool = False) -> str:
         source = str(text or "")
         if not source:
             return ""
 
-        output_chars = []
-        in_starred_segment = False
-        index = 0
-        length = len(source)
-
-        while index < length:
-            char = source[index]
-            if char == "*":
-                while index < length and source[index] == "*":
-                    index += 1
-                in_starred_segment = not in_starred_segment
-                continue
-
-            if not in_starred_segment:
-                output_chars.append(char)
-            index += 1
-
-        cleaned = "".join(output_chars)
+        star_index = source.find("*")
+        cleaned = source if star_index == -1 else source[:star_index]
         cleaned = re.sub(r"[ \t]+", " ", cleaned)
         cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
         return cleaned if preserve_edges else cleaned.strip()
@@ -242,26 +274,40 @@ class CloudLLMClient:
     def _post(self, user_text: str, stream: bool) -> requests.Response:
         self._check_cooldown()
 
-        try:
-            headers = None
-            if stream and self.prefer_stream_accept:
-                headers = {
-                    "Accept": "text/event-stream, application/x-ndjson, application/json, text/plain",
-                }
+        headers = None
+        if stream and self.prefer_stream_accept:
+            headers = {
+                "Accept": "text/event-stream, application/x-ndjson, application/json, text/plain",
+            }
 
-            response = self.session.post(
-                self.api_url,
-                json={"text": user_text},
-                timeout=(self.connect_timeout_seconds, self.timeout_seconds),
-                stream=stream,
-                headers=headers,
-            )
-            response.raise_for_status()
-            self._mark_success()
-            return response
-        except requests.RequestException as exc:
-            self._mark_failure()
-            raise CloudLLMError(f"Cloud LLM API request failed: {exc}") from exc
+        ordered_urls = self._ordered_api_urls()
+        last_exception: requests.RequestException | None = None
+
+        for endpoint in ordered_urls:
+            try:
+                response = self.session.post(
+                    endpoint,
+                    json={"text": user_text},
+                    timeout=(self.connect_timeout_seconds, self.timeout_seconds),
+                    stream=stream,
+                    headers=headers,
+                )
+                response.raise_for_status()
+                self._mark_success()
+                self._set_active_api_url(endpoint)
+                return response
+            except requests.RequestException as exc:
+                last_exception = exc
+                continue
+
+        self._mark_failure()
+        if last_exception is None:
+            raise CloudLLMError("Cloud LLM API request failed: no available endpoint")
+
+        attempted = ", ".join(ordered_urls)
+        raise CloudLLMError(
+            f"Cloud LLM API request failed across endpoints [{attempted}]: {last_exception}"
+        ) from last_exception
 
     def ask_serenity(self, user_text: str) -> str:
         text = str(user_text or "").strip()
@@ -277,7 +323,11 @@ class CloudLLMClient:
 
         answer = self._extract_text(payload)
         if answer:
-            return self._normalize_chunk(answer)
+            answer = self._normalize_chunk(answer)
+            answer, _ = self._truncate_after_first_asterisk(answer, False)
+            answer = answer.strip()
+            if answer:
+                return answer
 
         raise CloudLLMError("Cloud LLM API returned no usable response text")
 
@@ -293,6 +343,7 @@ class CloudLLMClient:
 
         response = self._post(text, stream=True)
         emitted = False
+        reached_first_asterisk = False
 
         with response:
             content_type = (response.headers.get("content-type") or "").lower()
@@ -334,9 +385,15 @@ class CloudLLMClient:
                             continue
 
                         chunk = self._normalize_chunk(token, preserve_edges=True)
+                        chunk, reached_first_asterisk = self._truncate_after_first_asterisk(
+                            chunk,
+                            reached_first_asterisk,
+                        )
                         if chunk:
                             emitted = True
                             yield chunk
+                        if reached_first_asterisk:
+                            break
                         continue
 
                     # Fallback line parsing for non-SSE JSONL responses.
@@ -346,9 +403,15 @@ class CloudLLMClient:
                     parsed = self._extract_text_from_json_blob(line)
                     if parsed:
                         chunk = self._normalize_chunk(parsed, preserve_edges=True)
+                        chunk, reached_first_asterisk = self._truncate_after_first_asterisk(
+                            chunk,
+                            reached_first_asterisk,
+                        )
                         if chunk:
                             emitted = True
                             yield chunk
+                        if reached_first_asterisk:
+                            break
                         continue
 
             # Standard JSON responses (non-streaming body).
@@ -370,10 +433,19 @@ class CloudLLMClient:
                             partial_response[len(streamed_response_text):],
                             preserve_edges=True,
                         )
+                        delta, reached_first_asterisk = self._truncate_after_first_asterisk(
+                            delta,
+                            reached_first_asterisk,
+                        )
                         streamed_response_text = partial_response
                         if delta:
                             emitted = True
                             yield delta
+                        if reached_first_asterisk:
+                            break
+
+                if reached_first_asterisk:
+                    return
 
                 body = "".join(body_parts)
                 chunk = self._extract_text_from_json_blob(body)
@@ -386,18 +458,32 @@ class CloudLLMClient:
                         remaining = chunk[len(streamed_response_text):]
 
                     remaining = self._normalize_chunk(remaining, preserve_edges=True)
+                    remaining, reached_first_asterisk = self._truncate_after_first_asterisk(
+                        remaining,
+                        reached_first_asterisk,
+                    )
                     if remaining:
                         emitted = True
                         yield remaining
+                    if reached_first_asterisk:
+                        return
 
             # Plain-text chunk streams.
             elif "text/plain" in content_type:
                 for raw_chunk in response.iter_content(chunk_size=128, decode_unicode=True):
                     chunk = self._normalize_chunk(str(raw_chunk or ""), preserve_edges=True)
+                    chunk, reached_first_asterisk = self._truncate_after_first_asterisk(
+                        chunk,
+                        reached_first_asterisk,
+                    )
                     if not chunk:
+                        if reached_first_asterisk:
+                            break
                         continue
                     emitted = True
                     yield chunk
+                    if reached_first_asterisk:
+                        break
 
             # Unknown payload type: parse as JSON blob first, then fall back to raw text.
             else:
@@ -413,10 +499,19 @@ class CloudLLMClient:
                     parsed = self._extract_text_from_json_blob(joined)
                     if parsed:
                         parsed = self._normalize_chunk(parsed)
+                        parsed, reached_first_asterisk = self._truncate_after_first_asterisk(
+                            parsed,
+                            reached_first_asterisk,
+                        )
                         emitted = True
-                        yield parsed
+                        if parsed:
+                            yield parsed
                     else:
                         cleaned_joined = self._normalize_chunk(joined)
+                        cleaned_joined, reached_first_asterisk = self._truncate_after_first_asterisk(
+                            cleaned_joined,
+                            reached_first_asterisk,
+                        )
                         if cleaned_joined:
                             emitted = True
                             yield cleaned_joined
