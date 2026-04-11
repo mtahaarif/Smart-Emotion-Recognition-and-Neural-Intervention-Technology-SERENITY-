@@ -140,7 +140,7 @@ class CloudLLMClient:
 
     def _normalize_chunk(self, text: str, preserve_edges: bool = False) -> str:
         if self.trust_polished_response:
-            normalized = self._strip_starred_segments(str(text or ""), preserve_edges=True).replace("\r", "")
+            normalized = str(text or "").replace("\r", "")
             normalized = re.sub(r"[ \t]+", " ", normalized)
             return normalized if preserve_edges else normalized.strip()
 
@@ -329,7 +329,9 @@ class CloudLLMClient:
 
                         token = obj.get("token")
                         if not isinstance(token, str) or not token.strip():
-                            token = self._extract_text(obj)
+                            # Ignore non-token SSE frames to avoid replaying full
+                            # response blobs as duplicate stream chunks.
+                            continue
 
                         chunk = self._normalize_chunk(token, preserve_edges=True)
                         if chunk:

@@ -49,6 +49,45 @@ const stripStarredSegments = (value, preserveEdges = false) => {
   return preserveEdges ? cleaned : cleaned.trim();
 };
 
+const cleanStreamToken = (token, inStarredSegment) => {
+  const source = String(token || '');
+  if (!source) {
+    return { cleanToken: '', inStarredSegment };
+  }
+
+  const output = [];
+  let index = 0;
+
+  while (index < source.length) {
+    const char = source[index];
+    if (char === '*') {
+      while (index < source.length && source[index] === '*') {
+        index += 1;
+      }
+      inStarredSegment = !inStarredSegment;
+      continue;
+    }
+
+    if (!inStarredSegment) {
+      output.push(char);
+    }
+    index += 1;
+  }
+
+  const cleanToken = output
+    .join('')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\s+([,.;:!?])/g, '$1');
+  return { cleanToken, inStarredSegment };
+};
+
+const hardClean = (value, preserveEdges = false) => {
+  let cleaned = stripStarredSegments(value, true);
+  cleaned = cleaned.replace(/([a-z])([A-Z])/g, '$1 $2');
+  cleaned = cleaned.replace(/\s+/g, ' ');
+  return preserveEdges ? cleaned : cleaned.trim();
+};
+
 const UnifiedEmotionPage = ({ user, onLogout }) => {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
@@ -65,6 +104,7 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
   const streamUiFrameRef = useRef(null);
   const streamUiPendingTextRef = useRef('');
   const streamUiPendingTurnRef = useRef(null);
+  const streamInStarredSegmentRef = useRef(false);
 
   const [cameraEnabled, setCameraEnabled] = useState(false);
   const [isCameraOn, setIsCameraOn] = useState(false);
@@ -361,7 +401,7 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
     }
 
     // Browser fallback when backend TTS is unavailable.
-    const fallbackText = stripStarredSegments(payload?.llm_response || '');
+    const fallbackText = hardClean(payload?.llm_response || '');
     if (!fallbackText || typeof window === 'undefined' || !window.speechSynthesis) {
       return;
     }
@@ -379,7 +419,7 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
   };
 
   const updateFromPayload = async (payload, fallbackUserText = '', source = 'voice', existingTurnId = null) => {
-    const cleanedAssistantReply = stripStarredSegments(payload?.llm_response || '');
+    const cleanedAssistantReply = hardClean(payload?.llm_response || '');
 
     setDominantEmotion(payload.dominant_emotion || 'Neutral');
     setSpeechEmotion(payload.speech_emotion || 'Neutral');
@@ -600,6 +640,7 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
     let provisionalEmotion = '';
 
     resetStreamAudioPlayback();
+    streamInStarredSegmentRef.current = false;
 
     await streamNdjson({
       url: `${API_BASE_URL}/api/interact/stream`,
@@ -678,30 +719,40 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
         }
 
         if (eventType === 'assistant_delta') {
-          const merged = stripStarredSegments(
-            String(event?.text || `${liveAssistantText}${String(event?.delta || '')}`),
-            true
-          );
-          if (merged === liveAssistantText) {
+          let rawToken = String(event?.delta || '');
+          if (!rawToken) {
+            const candidateText = String(event?.text || '');
+            if (candidateText) {
+              rawToken = candidateText.startsWith(liveAssistantText)
+                ? candidateText.slice(liveAssistantText.length)
+                : candidateText;
+            }
+          }
+
+          const { cleanToken, inStarredSegment } = cleanStreamToken(rawToken, streamInStarredSegmentRef.current);
+          streamInStarredSegmentRef.current = inStarredSegment;
+          if (!cleanToken) {
             return;
           }
-          liveAssistantText = merged;
+
+          liveAssistantText += cleanToken;
           if (SHOW_PROVISIONAL_ASSISTANT_TEXT) {
             if (!turnId) {
               turnId = appendConversationTurn({
                 userText: textFallback || '(processing...)',
-                assistantReply: merged,
+                assistantReply: liveAssistantText,
                 emotion: dominantEmotion,
                 source: 'voice',
               });
             }
-            scheduleStreamUiUpdate(merged, turnId);
+            scheduleStreamUiUpdate(liveAssistantText, turnId);
           }
           return;
         }
 
         if (eventType === 'assistant_replace') {
-          liveAssistantText = stripStarredSegments(String(event?.text || liveAssistantText));
+          liveAssistantText = hardClean(String(event?.text || liveAssistantText));
+          streamInStarredSegmentRef.current = false;
           if (liveAssistantText) {
             cancelStreamUiUpdate();
             setAssistantText(liveAssistantText);
@@ -743,7 +794,8 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
         }
 
         if (eventType === 'final') {
-          const finalReply = stripStarredSegments(event?.llm_response || liveAssistantText || '');
+          const finalReply = hardClean(event?.llm_response || liveAssistantText || '');
+          streamInStarredSegmentRef.current = false;
           const finalText = String(event?.transcription || textFallback || '').trim();
           setDominantEmotion(String(event?.dominant_emotion || 'Neutral'));
           setSpeechEmotion(String(event?.speech_emotion || 'Neutral'));
@@ -783,6 +835,7 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
     setTranscription('');
     cancelStreamUiUpdate();
     setAssistantText('');
+    streamInStarredSegmentRef.current = false;
     streamAudioQueueRef.current = [];
     streamAudioActiveRef.current = false;
     if (streamAudioElementRef.current) {
@@ -797,6 +850,7 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
     setSessionActive(false);
     setIsRecording(false);
     setIsProcessing(false);
+    streamInStarredSegmentRef.current = false;
     cancelStreamUiUpdate();
     streamAudioQueueRef.current = [];
     streamAudioActiveRef.current = false;
@@ -1005,6 +1059,7 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
       let liveAssistantText = '';
 
       resetStreamAudioPlayback();
+      streamInStarredSegmentRef.current = false;
 
       await streamNdjson({
         url: `${API_BASE_URL}/api/chat/stream`,
@@ -1028,14 +1083,23 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
           }
 
           if (eventType === 'assistant_delta') {
-            const merged = stripStarredSegments(
-              String(event?.text || `${liveAssistantText}${String(event?.delta || '')}`),
-              true
-            );
-            if (merged === liveAssistantText) {
+            let rawToken = String(event?.delta || '');
+            if (!rawToken) {
+              const candidateText = String(event?.text || '');
+              if (candidateText) {
+                rawToken = candidateText.startsWith(liveAssistantText)
+                  ? candidateText.slice(liveAssistantText.length)
+                  : candidateText;
+              }
+            }
+
+            const { cleanToken, inStarredSegment } = cleanStreamToken(rawToken, streamInStarredSegmentRef.current);
+            streamInStarredSegmentRef.current = inStarredSegment;
+            if (!cleanToken) {
               return;
             }
-            liveAssistantText = merged;
+
+            liveAssistantText += cleanToken;
             if (SHOW_PROVISIONAL_ASSISTANT_TEXT) {
               scheduleStreamUiUpdate(liveAssistantText, turnId);
             }
@@ -1043,7 +1107,8 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
           }
 
           if (eventType === 'assistant_replace') {
-            liveAssistantText = stripStarredSegments(String(event?.text || liveAssistantText));
+            liveAssistantText = hardClean(String(event?.text || liveAssistantText));
+            streamInStarredSegmentRef.current = false;
             if (liveAssistantText) {
               cancelStreamUiUpdate();
               setAssistantText(liveAssistantText);
@@ -1082,7 +1147,8 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
           }
 
           if (eventType === 'final') {
-            const finalReply = stripStarredSegments(event?.llm_response || liveAssistantText || '');
+            const finalReply = hardClean(event?.llm_response || liveAssistantText || '');
+            streamInStarredSegmentRef.current = false;
             cancelStreamUiUpdate();
             setTranscription(message);
             setAssistantText(finalReply);

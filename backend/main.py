@@ -108,6 +108,12 @@ HARD_CLEAN_PATTERNS = [
     re.compile(r"Reflecting feelings, then asking ONE follow-up question\.?", flags=re.IGNORECASE),
     re.compile(r"\bUser:|\bAssistant:", flags=re.IGNORECASE),
 ]
+PROMPT_LEAK_PATTERNS = [
+    re.compile(r"Reflecting feelings, then asking ONE follow-up question\.?", flags=re.IGNORECASE),
+    re.compile(r"\bReflecting\s*feelings?\b.*$", flags=re.IGNORECASE),
+    re.compile(r"\bthen asking(?:\s+one)?\s+follow-?up\s+question\b.*$", flags=re.IGNORECASE),
+    re.compile(r"\bdialogue while reflecting on personal responses\.?", flags=re.IGNORECASE),
+]
 GLUED_ALPHA_RUN_REGEX = re.compile(r"[A-Za-z]{12,}")
 
 
@@ -549,33 +555,41 @@ def _hard_clean_text(text: str, preserve_edges: bool = False) -> str:
     if not cleaned:
         return ""
 
-    for pattern in HARD_CLEAN_PATTERNS:
-        cleaned = pattern.sub("", cleaned)
-
-    # If upstream outputs a mostly space-less stream, recover likely word boundaries.
-    if wordninja is not None:
-        alpha_chars = sum(ch.isalpha() for ch in cleaned)
-        space_chars = cleaned.count(" ")
-        if alpha_chars >= 20 and space_chars <= max(1, alpha_chars // 24):
-            def _split_glued_run(match: re.Match) -> str:
-                token = match.group(0)
-                parts = wordninja.split(token)
-                if len(parts) <= 1:
-                    return token
-                return " ".join(parts)
-
-            cleaned = GLUED_ALPHA_RUN_REGEX.sub(_split_glued_run, cleaned)
-
-    cleaned = CAMEL_BOUNDARY_REGEX.sub(r"\1 \2", cleaned)
-    cleaned = re.sub(r"([.!?])([A-Za-z])", r"\1 \2", cleaned)
-    cleaned = re.sub(r"([,;:])([A-Za-z])", r"\1 \2", cleaned)
-    cleaned = re.sub(r"\b(\w+)\s+\1\b", r"\1", cleaned, flags=re.IGNORECASE)
+    # Match the same hard-clean style used by the standalone stream client.
+    cleaned = re.sub(r"([a-z])([A-Z])", r"\1 \2", cleaned)
     cleaned = WHITESPACE_REGEX.sub(" ", cleaned)
     return cleaned if preserve_edges else cleaned.strip()
 
 
+def _clean_stream_token(token: str, in_starred_segment: bool) -> tuple[str, bool]:
+    source = str(token or "")
+    if not source:
+        return "", in_starred_segment
+
+    output_chars: List[str] = []
+    index = 0
+    length = len(source)
+
+    while index < length:
+        char = source[index]
+        if char == "*":
+            while index < length and source[index] == "*":
+                index += 1
+            in_starred_segment = not in_starred_segment
+            continue
+
+        if not in_starred_segment:
+            output_chars.append(char)
+        index += 1
+
+    cleaned = "".join(output_chars)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    return cleaned, in_starred_segment
+
+
 def _normalize_polished_cloud_text(text: str, preserve_edges: bool = False) -> str:
-    normalized = _strip_starred_segments(str(text or ""), preserve_edges=True)
+    normalized = str(text or "")
     if not normalized:
         return ""
 
@@ -624,13 +638,104 @@ def _normalize_cloud_stream_piece(piece: str) -> str:
     return _hard_clean_text(text, preserve_edges=True)
 
 
+def _strip_prompt_leakage(text: str) -> str:
+    cleaned = str(text or "")
+    if not cleaned:
+        return ""
+
+    for pattern in PROMPT_LEAK_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+
+    cleaned = re.split(r"\bUser:|\bAssistant:", cleaned, maxsplit=1, flags=re.IGNORECASE)[0]
+    return cleaned
+
+
+def _collapse_repeated_ngrams(text: str) -> str:
+    cleaned = str(text or "")
+    if not cleaned:
+        return ""
+
+    for n in (10, 8, 6, 5, 4):
+        previous = None
+        while cleaned != previous:
+            previous = cleaned
+            cleaned = re.sub(
+                rf"(?i)\b((?:[\w']+\W+){{{n - 1}}}[\w']+)(?:\W+\1\b)+",
+                r"\1",
+                cleaned,
+            )
+
+    return cleaned
+
+
+def _dedupe_sentences(text: str, max_sentences: Optional[int] = None) -> str:
+    normalized = str(text or "")
+    if not normalized:
+        return ""
+
+    normalized = re.sub(r"([.!?])([A-Za-z])", r"\1 \2", normalized)
+    normalized = re.sub(r"([,;:])([A-Za-z])", r"\1 \2", normalized)
+    normalized = WHITESPACE_REGEX.sub(" ", normalized).strip()
+    if not normalized:
+        return ""
+
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", normalized) if part.strip()]
+    if not sentences:
+        return normalized
+
+    unique_sentences: List[str] = []
+    seen_keys = set()
+    for sentence in sentences:
+        key = re.sub(r"\W+", "", sentence.lower())
+        if key and key in seen_keys:
+            continue
+
+        if unique_sentences:
+            previous = unique_sentences[-1]
+            previous_key = re.sub(r"\W+", "", previous.lower())
+            if previous_key and key and (key in previous_key or previous_key in key):
+                continue
+
+            sentence_tokens = set(re.findall(r"[\w']+", sentence.lower()))
+            previous_tokens = set(re.findall(r"[\w']+", previous.lower()))
+            union = sentence_tokens.union(previous_tokens)
+            if union:
+                overlap_ratio = len(sentence_tokens.intersection(previous_tokens)) / len(union)
+                if overlap_ratio > 0.82:
+                    continue
+
+        if key:
+            seen_keys.add(key)
+        unique_sentences.append(sentence)
+
+        if max_sentences is not None and len(unique_sentences) >= max_sentences:
+            break
+
+    return " ".join(unique_sentences).strip() if unique_sentences else normalized
+
+
 def _sanitize_cloud_llm_response(text: str, max_words: int = 60) -> str:
     if TRUST_CLOUD_POLISHED_RESPONSE:
-        direct = _extract_text_from_cloud_blob(str(text or "")) or str(text or "")
-        direct = _normalize_polished_cloud_text(direct)
-        if direct:
-            return direct
-        return "I am here with you. Let's take one small step together."
+        cleaned = _extract_text_from_cloud_blob(str(text or "")) or str(text or "")
+        cleaned = _normalize_polished_cloud_text(cleaned)
+        cleaned = _strip_prompt_leakage(cleaned)
+        cleaned = _collapse_repeated_ngrams(cleaned)
+        cleaned = _dedupe_sentences(cleaned, max_sentences=3)
+        cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+        cleaned = re.sub(r"([.!?])(?:\s*[.!?])+", r"\1", cleaned)
+
+        words = cleaned.split()
+        if len(words) > max_words:
+            cleaned = " ".join(words[:max_words]).strip().rstrip(",;:") + "."
+
+        cleaned = cleaned.strip()
+        if not cleaned:
+            return "I am here with you. Let's take one small step together."
+
+        if cleaned[-1] not in ".!?":
+            cleaned = f"{cleaned}."
+
+        return cleaned
 
     cleaned = _hard_clean_text(str(text or ""))
     if not cleaned:
@@ -653,18 +758,7 @@ def _sanitize_cloud_llm_response(text: str, max_words: int = 60) -> str:
                 cleaned = escaped_value.replace("\\n", "\n").replace('\\"', '"')
             cleaned = _hard_clean_text(cleaned)
 
-    # Remove explicit prompt-instruction leakage if the remote model echoes it.
-    cleaned = re.sub(
-        r"Reflecting feelings, then asking ONE follow-up question\.?",
-        "",
-        cleaned,
-        flags=re.IGNORECASE,
-    )
-    cleaned = re.sub(r"\bReflecting\s*feelings?\b.*$", "", cleaned, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\bthen asking(?:\s+one)?\s+follow-?up\s+question\b.*$", "", cleaned, flags=re.IGNORECASE)
-
-    # Drop leaked chat transcript fragments like "User: ... Assistant: ...".
-    cleaned = re.split(r"\bUser:|\bAssistant:", cleaned, maxsplit=1, flags=re.IGNORECASE)[0]
+    cleaned = _strip_prompt_leakage(cleaned)
 
     # Normalize whitespace and strip markdown artifacts.
     cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
@@ -674,42 +768,12 @@ def _sanitize_cloud_llm_response(text: str, max_words: int = 60) -> str:
         cleaned,
     )
 
-    # Collapse repeated phrase loops produced by occasional cloud decoding glitches.
-    for n in (10, 8, 6, 5, 4):
-        previous = None
-        while cleaned != previous:
-            previous = cleaned
-            cleaned = re.sub(
-                rf"(?i)\b((?:[\w']+\W+){{{n - 1}}}[\w']+)(?:\W+\1\b)+",
-                r"\1",
-                cleaned,
-            )
+    cleaned = _collapse_repeated_ngrams(cleaned)
 
     cleaned = WHITESPACE_REGEX.sub(" ", cleaned).strip()
-
-    # Remove repeated sentences while preserving order.
-    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", cleaned) if part.strip()]
-    unique_sentences: List[str] = []
-    seen = set()
-    for sentence in sentences:
-        key = re.sub(r"\W+", "", sentence.lower())
-        if key and key in seen:
-            continue
-        if unique_sentences:
-            previous_key = re.sub(r"\W+", "", unique_sentences[-1].lower())
-            if previous_key and key:
-                overlap_ratio = min(len(previous_key), len(key)) / max(len(previous_key), len(key))
-                if overlap_ratio > 0.7 and (key in previous_key or previous_key in key):
-                    continue
-        if key:
-            seen.add(key)
-        unique_sentences.append(sentence)
-
-    cleaned = " ".join(unique_sentences).strip() if unique_sentences else cleaned
-
-    # Keep only the most meaningful short therapeutic response.
-    if unique_sentences:
-        cleaned = " ".join(unique_sentences[:3]).strip()
+    cleaned = _dedupe_sentences(cleaned, max_sentences=3)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"([.!?])(?:\s*[.!?])+", r"\1", cleaned)
 
     # Keep response concise for frontend UX.
     words = cleaned.split()
@@ -1037,6 +1101,7 @@ async def _stream_multimodal_generation(
     raw_stream_text = ""
     display_text = ""
     sentence_stream_buffer = ""
+    in_starred_segment = False
     final_response = ""
     sentence_sequence = 0
     sentence_key_to_sequence: Dict[str, int] = {}
@@ -1135,32 +1200,21 @@ async def _stream_multimodal_generation(
 
                 raw_stream_text += piece
 
-                if TRUST_CLOUD_POLISHED_RESPONSE:
-                    candidate_text = _normalize_polished_cloud_text(raw_stream_text, preserve_edges=True)
-                else:
-                    candidate_text = _hard_clean_text(raw_stream_text, preserve_edges=True)
-                if not candidate_text or candidate_text == display_text:
+                clean_piece, in_starred_segment = _clean_stream_token(piece, in_starred_segment)
+                if not clean_piece:
                     continue
 
-                if candidate_text.startswith(display_text):
-                    delta = candidate_text[len(display_text):]
-                    if stream_sentence_tts_live:
-                        sentence_stream_buffer += delta
-                else:
-                    delta = candidate_text
-                    if stream_sentence_tts_live:
-                        sentence_stream_buffer = candidate_text
-
-                display_text = candidate_text
+                display_text += clean_piece
                 if emit_provisional_text:
                     yield {
                         "type": "assistant_delta",
-                        "delta": delta,
+                        "delta": clean_piece,
                         "text": display_text,
                     }
                     emitted = True
 
                 if stream_sentence_tts_live:
+                    sentence_stream_buffer += clean_piece
                     completed_sentences, sentence_stream_buffer = _drain_complete_sentences(sentence_stream_buffer)
                     for sentence_text in completed_sentences:
                         registered = _register_sentence(sentence_text)
@@ -1194,7 +1248,11 @@ async def _stream_multimodal_generation(
         producer_final_text = str(await generation_task or "").strip()
         if not raw_stream_text:
             raw_stream_text = producer_final_text
-        final_response = _sanitize_cloud_llm_response(producer_final_text or display_text or raw_stream_text)
+
+        if not display_text:
+            display_text = _hard_clean_text(producer_final_text or raw_stream_text, preserve_edges=True)
+
+        final_response = _sanitize_cloud_llm_response(display_text or producer_final_text or raw_stream_text)
     except asyncio.TimeoutError:
         generation_task.cancel()
         with contextlib.suppress(Exception):
