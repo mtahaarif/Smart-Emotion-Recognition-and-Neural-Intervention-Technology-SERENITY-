@@ -7,7 +7,7 @@ This repository currently runs a local-first stack with:
 - React + Vite frontend for real-time therapy loop UX
 - TFLite FER/SER inference for facial and speech emotion signals
 - Whisper-based transcription
-- Emotion-aware RAG + Qwen2.5 generation
+- Cloud-hosted LLM generation via EC2 `/chat` endpoint
 - Edge TTS with sentence-level streaming playback
 - SQLite persistence for user accounts and conversation memory
 
@@ -21,16 +21,17 @@ This repository currently runs a local-first stack with:
 - Emotion fusion (`speech + face`) with normalized probability vectors
 - Streaming assistant responses over NDJSON
 - Sentence-level TTS chunk generation and playback queue
+- Automatic redaction of `*...*` / `**...**` thought traces from UI text and TTS
 - Text-only chat mode (`/api/chat`, `/api/chat/stream`)
 - Local conversation memory using `conversation_turns` table
-- Optional cloud LLM transport mode using AWS SQS
+- Cloud LLM streaming and fail-fast resilience (timeout + cooldown)
 
 ### Current Progress (Code-Verified)
 - Core multimodal loop: done
 - Streaming protocol (backend + frontend consumer): done
-- Local RAG runtime integration: done
+- Cloud LLM integration (EC2 HTTP streaming): done
 - Fallback handling (LLM/TTS/STT and endpoint fallback): done
-- Cloud offload transport adapter (SQS path): done (optional mode)
+- LLM output sanitation and thought-redaction for UI/TTS safety: done
 - Security hardening for production auth/data: pending
 - Automated tests and CI pipeline: pending
 - Production deployment profiles and observability: pending
@@ -47,9 +48,9 @@ FastAPI (backend/main.py)
      - FER runtime (TFLite)
      - SER runtime (TFLite)
      - STT backend (faster-whisper preferred, openai-whisper fallback)
-     - LLM runtime (local RAG) OR cloud transport client (SQS)
+    - Cloud LLM client (HTTP/SSE to EC2 `/chat` endpoint)
   -> Parallel task orchestration + timeout guards
-  -> Emotion fusion + response generation + TTS
+  -> Emotion fusion + response generation + thought-redaction + TTS
   -> SQLite persistence (SQLAlchemy)
 
 Model/Data Assets
@@ -107,6 +108,8 @@ The frontend parser in `frontend/src/pages/UnifiedEmotionPage.jsx` consumes one 
 - `final`
   - `{ type, llm_response, transcription, dominant_emotion, speech_emotion, face_emotion }`
 
+Sanitization guarantee: assistant text wrapped in `*...*` or `**...**` is removed in backend normalization before it is emitted as stream text and before sentence-level TTS synthesis.
+
 Note: `generation_result` is an internal backend event used to finalize state, not forwarded directly to the frontend stream UI.
 
 ## 5. API Surface (Current)
@@ -162,13 +165,16 @@ Note: `generation_result` is an internal backend event used to finalize state, n
 - Fallback: `openai-whisper`
 - Model size configurable (`SERENITY_WHISPER_MODEL_SIZE`, default `tiny`)
 
-### RAG + LLM
+### LLM (Current Runtime Path)
+- Cloud client module: `backend/cloud_llm_core.py`
+- Upstream API: `POST {SERENITY_CLOUD_LLM_URL}` (default EC2 `/chat`)
+- Supports streaming (`text/event-stream` / NDJSON / chunked JSON) and non-stream responses
+- Includes fail-fast connection/read timeouts, failure threshold, and cooldown breaker
+- Backend applies output sanitization to prevent prompt/thought leakage in UI/TTS
+
+### Local LLM Assets (Optional/Legacy)
 - Module: `backend/llm_core.py`
-- Embedding model: `all-MiniLM-L6-v2`
-- Vector store: FAISS index + serialized chunks
-- Primary LLM: `Qwen/Qwen2.5-1.5B-Instruct`
-- Fallback model list supported via env
-- Generates short empathetic replies with guardrails and fallback templates
+- FAISS and chunk assets remain in repository for local experimentation paths
 
 ### TTS
 - Module: backend helpers in `main.py`
@@ -215,24 +221,43 @@ Main app flow:
 ## 9. Environment and Config
 
 ### High-Impact Backend Variables
-- `SERENITY_LLM_MODE` (`local` or `cloud`)
-- `SERENITY_SKIP_RAG_STARTUP`
 - `SERENITY_WHISPER_MODEL_SIZE`
 - `SERENITY_WHISPER_CPU_THREADS`
 - `SERENITY_TTS_ENABLED`
 - `SERENITY_TTS_STREAMING_ENABLED`
 - `SERENITY_STREAM_TOKEN_DELTA`
 - `SERENITY_STREAM_TTS_SENTENCE_AUDIO`
+- `SERENITY_STREAM_TTS_FINAL_TEXT_ONLY`
+- `SERENITY_TRUST_CLOUD_POLISHED_RESPONSE`
 - `SERENITY_CLOUD_LLM_TIMEOUT_SECONDS`
+- `SERENITY_CLOUD_LLM_CONNECT_TIMEOUT_SECONDS`
+- `SERENITY_CLOUD_LLM_FAILURE_THRESHOLD`
+- `SERENITY_CLOUD_LLM_COOLDOWN_SECONDS`
 
-### Cloud Mode Variables (AWS SQS)
-- `AWS_REGION`
-- `SERENITY_SQS_REQUEST_QUEUE_URL`
-- `SERENITY_SQS_RESULT_QUEUE_URL`
-- `SERENITY_SQS_GROUP_ID`
+### Cloud LLM Variables (EC2 HTTP)
+- `SERENITY_CLOUD_LLM_URL` (example: `http://16.171.3.197:8000/chat`)
+- `SERENITY_CLOUD_LLM_EXPECT_SSE`
+- `SERENITY_CLOUD_LLM_PREFER_STREAM_ACCEPT`
+- `SERENITY_CLOUD_LLM_TIMEOUT_SECONDS`
+- `SERENITY_CLOUD_LLM_CONNECT_TIMEOUT_SECONDS`
+- `SERENITY_CLOUD_LLM_FAILURE_THRESHOLD`
+- `SERENITY_CLOUD_LLM_COOLDOWN_SECONDS`
 
 ### Frontend Variable
 - `VITE_API_BASE_URL` (defaults to `http://127.0.0.1:5000`)
+
+### Edge Profile (Raspberry Pi 5)
+- `SERENITY_EDGE_OPTIMIZED_MODE=true`
+- `SERENITY_LAZY_RUNTIME_INIT=true`
+- `SERENITY_WHISPER_PRELOAD_ENABLED=false`
+- `SERENITY_CLOUD_LLM_WARMUP_ENABLED=false`
+- `SERENITY_TTS_WARMUP_ENABLED=false`
+- `SERENITY_STREAM_TOKEN_DELTA=true`
+- `SERENITY_STREAM_PROVISIONAL_TEXT=true`
+- `SERENITY_STREAM_TTS_SENTENCE_AUDIO=true`
+- `SERENITY_STREAM_TTS_FINAL_TEXT_ONLY=false`
+- `SERENITY_CLOUD_LLM_CONNECT_TIMEOUT_SECONDS=4`
+- `SERENITY_CLOUD_LLM_TIMEOUT_SECONDS=12`
 
 ## 10. Setup and Run
 
@@ -253,6 +278,11 @@ cd ..
 ### 3) Run backend
 ```powershell
 python -m uvicorn backend.main:app --host 127.0.0.1 --port 5000
+```
+
+### Edge Install (Recommended for Pi)
+```powershell
+pip install -r requirements-edge.txt
 ```
 
 ### 4) Run frontend
@@ -358,20 +388,20 @@ FYP/
   README.md
 ```
 
-## 15. Hybrid Target Direction (Edge + AWS)
+## 15. Hybrid Target Direction (Edge + EC2 Cloud LLM)
 
 The codebase already supports a practical hybrid migration path:
 - Keep capture + FER/SER/STT + UI on edge/local node
-- Offload LLM generation to cloud worker via SQS
+- Offload LLM generation to cloud EC2 endpoint over HTTP/SSE
 
 Current enabler in code:
-- `backend/cloud_llm_core.py` + `SERENITY_LLM_MODE=cloud`
+- `backend/cloud_llm_core.py` + `SERENITY_CLOUD_LLM_URL`
 
 Next required steps:
-1. Implement/secure worker service contract.
-2. Add signed payload validation and stricter IAM policies.
-3. Add queue DLQ and observability dashboards.
-4. Benchmark cost-latency tradeoffs for target hardware.
+1. Harden EC2 endpoint auth and transport security (TLS, request signing, allow-listing).
+2. Add observability around upstream latency, timeouts, and cooldown activations.
+3. Add deployment profiles for autoscaling and health-probe based rollouts.
+4. Benchmark cost-latency tradeoffs for target hardware and workload sizes.
 
 ---
 

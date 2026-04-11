@@ -24,7 +24,25 @@ if not exist "frontend" (
 
 echo [1/3] Starting Backend Server...
 echo.
-start "Serenity Backend" cmd /k "cd backend && python app.py"
+set "PYTHON_CMD=python"
+if exist "%~dp0.venv\Scripts\python.exe" set "PYTHON_CMD=%~dp0.venv\Scripts\python.exe"
+
+:: Edge-optimized defaults (can be overridden by existing environment variables)
+set "SERENITY_EDGE_OPTIMIZED_MODE=true"
+set "SERENITY_LAZY_RUNTIME_INIT=true"
+set "SERENITY_WHISPER_PRELOAD_ENABLED=false"
+set "SERENITY_CLOUD_LLM_WARMUP_ENABLED=false"
+set "SERENITY_TTS_WARMUP_ENABLED=false"
+set "SERENITY_STREAM_TOKEN_DELTA=true"
+set "SERENITY_STREAM_PROVISIONAL_TEXT=true"
+set "SERENITY_STREAM_TTS_SENTENCE_AUDIO=true"
+set "SERENITY_STREAM_TTS_FINAL_TEXT_ONLY=false"
+set "SERENITY_CLOUD_LLM_CONNECT_TIMEOUT_SECONDS=4"
+set "SERENITY_CLOUD_LLM_TIMEOUT_SECONDS=12"
+set "SERENITY_CLOUD_LLM_FAILURE_THRESHOLD=2"
+set "SERENITY_CLOUD_LLM_COOLDOWN_SECONDS=30"
+
+start "Serenity Backend" cmd /k "cd /d \"%~dp0\" && \"%PYTHON_CMD%\" -m uvicorn backend.main:app --host 127.0.0.1 --port 5000"
 
 timeout /t 3 /nobreak >nul
 

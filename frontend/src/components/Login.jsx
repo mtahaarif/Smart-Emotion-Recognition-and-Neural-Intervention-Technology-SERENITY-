@@ -2,6 +2,8 @@ import React, { useState } from 'react';
 import axios from 'axios';
 import { User, Lock, UserPlus, LogIn } from 'lucide-react';
 
+const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:5000';
+
 const Login = ({ onLogin }) => {
   const [isRegistering, setIsRegistering] = useState(false);
   const [username, setUsername] = useState('');
@@ -15,11 +17,11 @@ const Login = ({ onLogin }) => {
     setMessage('');
 
     const endpoint = isRegistering ? 'register' : 'login';
-    const url = `http://127.0.0.1:5000/${endpoint}`;
+    const url = `${API_BASE_URL}/${endpoint}`;
 
     try {
       const response = await axios.post(url, {
-        username: username,
+        username: username.trim(),
         password: password
       });
 

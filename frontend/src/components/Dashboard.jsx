@@ -32,7 +32,7 @@ const Dashboard = ({ user, onLogout }) => {
           </div>
           <h2 className="text-4xl font-bold text-gray-800">Hello, {user}.</h2>
           <p className="text-xl text-gray-500 max-w-lg">
-            I am your AI Psychiatrist. I will analyze your facial expressions and voice tone in real-time.
+            I am your AI Psychologist. I will analyze your facial expressions and voice tone in real-time.
           </p>
           <button
             onClick={handleStartSession}

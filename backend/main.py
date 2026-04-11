@@ -1,40 +1,62 @@
 import asyncio
 import base64
 import contextlib
+import importlib
+import json
 import logging
 import os
+import re
+import threading
 import tempfile
+import time
 import uuid
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 try:
-    from .audio_core import predict_audio_emotion
-    from .emotion_core import analyze_face
-    from .llm_core import init_rag_system
-    from .database import SessionLocal, engine, fetch_recent_turns, persist_turn
-    from . import models
+    import torch
 except ImportError:
-    # Allow direct module execution patterns where relative imports are unavailable.
-    from audio_core import predict_audio_emotion
-    from emotion_core import analyze_face
-    from llm_core import init_rag_system
-    from database import SessionLocal, engine, fetch_recent_turns, persist_turn
-    import models
+    torch = None
 
 try:
-    import whisper
+    from .audio_core import initialize_audio_runtime, predict_audio_emotion
+    from .emotion_core import initialize_face_runtime, analyze_face
+    from .database import SessionLocal, engine, fetch_recent_turns, persist_turn
+    from .cloud_llm_core import CloudLLMClient, CloudLLMError
+    from . import models
 except ImportError:
-    whisper = None
+    # Allow both package and direct module execution patterns.
+    from backend.audio_core import initialize_audio_runtime, predict_audio_emotion
+    from backend.emotion_core import initialize_face_runtime, analyze_face
+    from backend.database import SessionLocal, engine, fetch_recent_turns, persist_turn
+    from backend.cloud_llm_core import CloudLLMClient, CloudLLMError
+    import backend.models as models
+
+try:
+    faster_whisper_module = importlib.import_module("faster_whisper")
+    WhisperModel = getattr(faster_whisper_module, "WhisperModel", None)
+except ImportError:
+    WhisperModel = None
+
+try:
+    import whisper as openai_whisper
+except ImportError:
+    openai_whisper = None
 
 try:
     import edge_tts
 except ImportError:
     edge_tts = None
+
+try:
+    import wordninja
+except ImportError:
+    wordninja = None
 
 LOGGER = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -51,18 +73,6 @@ class AuthResponse(BaseModel):
     username: str
 
 
-class DetectEmotionRequest(BaseModel):
-    image: str = Field(..., description="Base64-encoded image payload.")
-    user_message: Optional[str] = Field(default=None, description="Optional user text context.")
-
-
-class EmotionAnalysisResponse(BaseModel):
-    emotion: str
-    confidence: float
-    ai_message: str
-    error: Optional[str] = None
-
-
 class HealthResponse(BaseModel):
     status: str
     rag_loaded: bool
@@ -75,6 +85,7 @@ class InteractResponse(BaseModel):
     transcription: str
     llm_response: str
     tts_audio_base64: Optional[str] = None
+    tts_audio_segments_base64: List[str] = Field(default_factory=list)
     errors: List[str] = Field(default_factory=list)
 
 
@@ -82,8 +93,216 @@ class ChatRequest(BaseModel):
     username: str
     message: str
 
+EMOTION_LABELS = ["angry", "calm", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
+EMOTION_ALIAS = {
+    "surprised": "surprise",
+    "fearful": "fear",
+    "no face": "neutral",
+}
+SENTENCE_BOUNDARY_REGEX = re.compile(r"(?<=[.!?])\s+")
+CAMEL_BOUNDARY_REGEX = re.compile(r"([a-z])([A-Z])")
+WHITESPACE_REGEX = re.compile(r"\s+")
+HARD_CLEAN_PATTERNS = [
+    re.compile(r"\*(?:Reflects\s*feelings|Reflectsfeelings)\*", flags=re.IGNORECASE),
+    re.compile(r"\*(?:Asks\s*follow-?up\s*question|Asksfollow-?upquestion)\*", flags=re.IGNORECASE),
+    re.compile(r"Reflecting feelings, then asking ONE follow-up question\.?", flags=re.IGNORECASE),
+    re.compile(r"\bUser:|\bAssistant:", flags=re.IGNORECASE),
+]
+GLUED_ALPHA_RUN_REGEX = re.compile(r"[A-Za-z]{12,}")
 
-app = FastAPI(title="SERENITY API", version="1.0.0")
+
+def _env_bool(name: str, default: bool) -> bool:
+    return os.getenv(name, str(default)).strip().lower() == "true"
+
+
+EDGE_OPTIMIZED_MODE = _env_bool("SERENITY_EDGE_OPTIMIZED_MODE", True)
+LAZY_RUNTIME_INIT = _env_bool("SERENITY_LAZY_RUNTIME_INIT", EDGE_OPTIMIZED_MODE)
+WHISPER_PRELOAD_ENABLED = _env_bool("SERENITY_WHISPER_PRELOAD_ENABLED", not EDGE_OPTIMIZED_MODE)
+
+WHISPER_MODEL_SIZE = os.getenv("SERENITY_WHISPER_MODEL_SIZE", "tiny").strip()
+WHISPER_CPU_THREADS = int(os.getenv("SERENITY_WHISPER_CPU_THREADS", str(max(1, (os.cpu_count() or 4) - 1))))
+WHISPER_COMPUTE_TYPE_CPU = os.getenv("SERENITY_WHISPER_COMPUTE_TYPE_CPU", "int8").strip()
+REQUIRE_STT_BACKEND = _env_bool("SERENITY_REQUIRE_STT_BACKEND", False)
+WHISPER_TIMEOUT_SECONDS = int(os.getenv("SERENITY_WHISPER_TIMEOUT_SECONDS", "40"))
+EMOTION_TIMEOUT_SECONDS = int(os.getenv("SERENITY_EMOTION_TIMEOUT_SECONDS", "20"))
+LLM_TIMEOUT_SECONDS = int(os.getenv("SERENITY_LLM_TIMEOUT_SECONDS", "90" if EDGE_OPTIMIZED_MODE else "180"))
+TTS_TIMEOUT_SECONDS = 30
+TTS_ENABLED = _env_bool("SERENITY_TTS_ENABLED", True)
+TTS_FAILURE_THRESHOLD = int(os.getenv("SERENITY_TTS_FAILURE_THRESHOLD", "3"))
+TTS_COOLDOWN_SECONDS = int(os.getenv("SERENITY_TTS_COOLDOWN_SECONDS", "180"))
+TTS_VOICE = os.getenv("SERENITY_TTS_VOICE", "en-GB-RyanNeural").strip()
+TTS_RATE = os.getenv("SERENITY_TTS_RATE", "+0%").strip()
+TTS_PITCH = os.getenv("SERENITY_TTS_PITCH", "+0Hz").strip()
+TTS_STREAMING_ENABLED = _env_bool("SERENITY_TTS_STREAMING_ENABLED", True)
+TTS_WARMUP_ENABLED = _env_bool("SERENITY_TTS_WARMUP_ENABLED", not EDGE_OPTIMIZED_MODE)
+STREAM_TOKEN_DELTA = _env_bool("SERENITY_STREAM_TOKEN_DELTA", True)
+STREAM_PROVISIONAL_TEXT = _env_bool("SERENITY_STREAM_PROVISIONAL_TEXT", True)
+STREAM_TTS_SENTENCE_AUDIO = _env_bool("SERENITY_STREAM_TTS_SENTENCE_AUDIO", True)
+STREAM_TTS_FINAL_TEXT_ONLY = _env_bool("SERENITY_STREAM_TTS_FINAL_TEXT_ONLY", False)
+TRUST_CLOUD_POLISHED_RESPONSE = _env_bool("SERENITY_TRUST_CLOUD_POLISHED_RESPONSE", True)
+CLOUD_LLM_WARMUP_ENABLED = _env_bool("SERENITY_CLOUD_LLM_WARMUP_ENABLED", not EDGE_OPTIMIZED_MODE)
+CLOUD_LLM_WARMUP_TEXT = os.getenv("SERENITY_CLOUD_LLM_WARMUP_TEXT", "Hello").strip() or "Hello"
+CLOUD_LLM_WARMUP_TIMEOUT_SECONDS = int(os.getenv("SERENITY_CLOUD_LLM_WARMUP_TIMEOUT_SECONDS", "45"))
+
+llm_generation_semaphore = asyncio.Semaphore(1)
+tts_consecutive_failures = 0
+tts_disabled_until_epoch = 0.0
+whisper_init_lock = threading.Lock()
+
+
+def _state_get(key: str, default=None):
+    return getattr(app.state, key, default)
+
+
+def _state_set(key: str, value) -> None:
+    setattr(app.state, key, value)
+
+
+def _ensure_whisper_runtime_sync() -> Optional[str]:
+    whisper_model = _state_get("whisper_model")
+    if whisper_model is not None:
+        return None
+
+    if _state_get("whisper_backend") == "none":
+        message = str(_state_get("whisper_init_error") or "No STT backend available.")
+        if REQUIRE_STT_BACKEND:
+            raise RuntimeError(message)
+        return message
+
+    with whisper_init_lock:
+        whisper_model = _state_get("whisper_model")
+        if whisper_model is not None:
+            return None
+
+        if _state_get("whisper_backend") == "none":
+            message = str(_state_get("whisper_init_error") or "No STT backend available.")
+            if REQUIRE_STT_BACKEND:
+                raise RuntimeError(message)
+            return message
+
+        whisper_device = _state_get("whisper_device_in_use", "cpu")
+        try:
+            if WhisperModel is not None:
+                whisper_compute_type = "float16" if whisper_device == "cuda" else WHISPER_COMPUTE_TYPE_CPU
+                loaded_model = WhisperModel(
+                    WHISPER_MODEL_SIZE,
+                    device=whisper_device,
+                    compute_type=whisper_compute_type,
+                    cpu_threads=WHISPER_CPU_THREADS,
+                    num_workers=1,
+                )
+                _state_set("whisper_backend", "faster-whisper")
+                _state_set("whisper_model", loaded_model)
+                _state_set("whisper_init_error", None)
+                LOGGER.info(
+                    "Loaded faster-whisper '%s' on %s (%s)",
+                    WHISPER_MODEL_SIZE,
+                    whisper_device.upper(),
+                    whisper_compute_type,
+                )
+                return None
+
+            if openai_whisper is not None:
+                loaded_model = openai_whisper.load_model(WHISPER_MODEL_SIZE, device=whisper_device)
+                _state_set("whisper_backend", "openai-whisper")
+                _state_set("whisper_model", loaded_model)
+                _state_set("whisper_init_error", None)
+                LOGGER.warning(
+                    "faster-whisper not installed; loaded openai-whisper '%s' on %s",
+                    WHISPER_MODEL_SIZE,
+                    whisper_device.upper(),
+                )
+                return None
+
+            message = "No STT backend available. Install faster-whisper or openai-whisper."
+            _state_set("whisper_backend", "none")
+            _state_set("whisper_model", None)
+            _state_set("whisper_init_error", message)
+            if REQUIRE_STT_BACKEND:
+                raise RuntimeError(message)
+            LOGGER.warning("%s Voice transcription endpoints will return a runtime warning.", message)
+            return message
+        except Exception as exc:
+            message = f"Failed to initialize STT backend: {exc}"
+            _state_set("whisper_backend", "none")
+            _state_set("whisper_model", None)
+            _state_set("whisper_init_error", message)
+            if REQUIRE_STT_BACKEND:
+                raise RuntimeError(message) from exc
+            LOGGER.warning("%s", message)
+            return message
+
+
+@contextlib.asynccontextmanager
+async def serenity_lifespan(fastapi_app: FastAPI):
+    LOGGER.info("Preloading SERENITY edge runtime into FastAPI app.state")
+
+    fastapi_app.state.rag_init_error = None
+    fastapi_app.state.cloud_llm_client = None
+    fastapi_app.state.cloud_llm_warmup_task = None
+    fastapi_app.state.tts_warmed_up = False
+    fastapi_app.state.tts_warmup_task = None
+    fastapi_app.state.whisper_model = None
+    fastapi_app.state.whisper_backend = "uninitialized"
+    fastapi_app.state.whisper_init_error = None
+    fastapi_app.state.face_runtime = None
+    fastapi_app.state.speech_runtime = None
+
+    # Edge profile can defer heavy runtimes until first real request.
+    if not LAZY_RUNTIME_INIT:
+        fastapi_app.state.face_runtime = await run_in_threadpool(initialize_face_runtime)
+        fastapi_app.state.speech_runtime = await run_in_threadpool(initialize_audio_runtime)
+    else:
+        LOGGER.info("Lazy runtime init enabled: FER/SER models will load on first use.")
+
+    # STT backend can also be deferred for edge memory savings.
+    whisper_device = "cuda" if (torch is not None and torch.cuda.is_available()) else "cpu"
+    fastapi_app.state.whisper_device_in_use = whisper_device
+
+    if WHISPER_PRELOAD_ENABLED:
+        await run_in_threadpool(_ensure_whisper_runtime_sync)
+    else:
+        LOGGER.info("Whisper preload disabled: STT model will load on first transcription request.")
+
+    try:
+        fastapi_app.state.cloud_llm_client = CloudLLMClient()
+        LOGGER.info("Cloud LLM API client initialized successfully")
+    except CloudLLMError as exc:
+        fastapi_app.state.rag_init_error = str(exc)
+        LOGGER.warning("Cloud LLM client initialization failed: %s", exc)
+
+    if CLOUD_LLM_WARMUP_ENABLED and fastapi_app.state.cloud_llm_client is not None:
+        fastapi_app.state.cloud_llm_warmup_task = asyncio.create_task(_warmup_cloud_llm_once())
+
+    if TTS_WARMUP_ENABLED and TTS_ENABLED and edge_tts is not None:
+        fastapi_app.state.tts_warmup_task = asyncio.create_task(_warmup_edge_tts_once())
+
+    try:
+        yield
+    except asyncio.CancelledError:
+        # Uvicorn shutdown on Windows can cancel the lifespan receive queue during Ctrl+C.
+        # Treat this as a normal shutdown path to avoid noisy traceback logs.
+        LOGGER.info("Lifespan cancellation received during shutdown.")
+    finally:
+        warmup_task = getattr(fastapi_app.state, "tts_warmup_task", None)
+        if warmup_task is not None and not warmup_task.done():
+            warmup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await warmup_task
+
+        cloud_warmup_task = getattr(fastapi_app.state, "cloud_llm_warmup_task", None)
+        if cloud_warmup_task is not None and not cloud_warmup_task.done():
+            cloud_warmup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await cloud_warmup_task
+
+        cloud_client = getattr(fastapi_app.state, "cloud_llm_client", None)
+        if cloud_client is not None:
+            with contextlib.suppress(Exception):
+                cloud_client.close()
+
+
+app = FastAPI(title="SERENITY API", version="1.0.0", lifespan=serenity_lifespan)
 
 # Create database tables on startup
 models.Base.metadata.create_all(bind=engine)
@@ -95,23 +314,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-serenity_bot = None
-whisper_model = None
-rag_init_task = None
-llm_generation_semaphore = asyncio.Semaphore(1)
-
-EMOTION_LABELS = ["angry", "calm", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
-EMOTION_ALIAS = {
-    "surprised": "surprise",
-    "fearful": "fear",
-    "no face": "neutral",
-}
-
-WHISPER_TIMEOUT_SECONDS = 40
-EMOTION_TIMEOUT_SECONDS = 20
-LLM_TIMEOUT_SECONDS = 90
-TTS_TIMEOUT_SECONDS = 30
 
 
 # --- AUTH ENDPOINTS ---
@@ -208,20 +410,20 @@ def _to_probability_vector(emotion: str, confidence: float) -> Dict[str, float]:
     return probs
 
 
-def _fuse_emotions(
-    speech_emotion: str,
-    speech_confidence: float,
-    face_emotion: str,
-    face_confidence: float,
-) -> str:
-    speech_probs = _to_probability_vector(speech_emotion, speech_confidence)
-    face_probs = _to_probability_vector(face_emotion, face_confidence)
-
-    fused = {
+def _fuse_probability_vectors(
+    speech_probs: Dict[str, float],
+    face_probs: Dict[str, float],
+) -> Dict[str, float]:
+    return {
         label: (speech_probs[label] + face_probs[label]) / 2.0
         for label in EMOTION_LABELS
     }
-    dominant = max(fused.items(), key=lambda item: item[1])[0]
+
+
+def _dominant_from_probabilities(probabilities: Dict[str, float]) -> str:
+    if not probabilities:
+        return "Neutral"
+    dominant = max(probabilities.items(), key=lambda item: item[1])[0]
     return dominant.title()
 
 
@@ -238,29 +440,381 @@ def _serialize_turns(turns: list) -> List[Dict[str, str]]:
     return history
 
 
+async def _consume_streaming_tts(
+    sentence_queue: "asyncio.Queue[Optional[str]]",
+) -> tuple[List[str], List[str]]:
+    audio_segments: List[str] = []
+    tts_errors: List[str] = []
+
+    while True:
+        sentence = await sentence_queue.get()
+        if sentence is None:
+            break
+
+        encoded_audio, tts_error = await _generate_tts_base64(sentence)
+        if encoded_audio:
+            audio_segments.append(encoded_audio)
+        if tts_error:
+            tts_errors.append(tts_error)
+
+    return audio_segments, tts_errors
+
+
+def _to_ndjson_event(payload: Dict[str, object]) -> str:
+    return json.dumps(payload, ensure_ascii=False) + "\n"
+
+
+def _extract_text_from_cloud_payload(payload: object) -> str:
+    if isinstance(payload, str):
+        return payload.strip()
+
+    if isinstance(payload, dict):
+        for key in (
+            "response",
+            "reply",
+            "answer",
+            "text",
+            "llm_response",
+            "message",
+            "delta",
+            "token",
+            "content",
+        ):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+
+        choices = payload.get("choices")
+        if isinstance(choices, list) and choices:
+            first = choices[0]
+            if isinstance(first, dict):
+                delta = first.get("delta")
+                if isinstance(delta, dict):
+                    content = delta.get("content")
+                    if isinstance(content, str) and content:
+                        return content
+
+                message = first.get("message")
+                if isinstance(message, dict):
+                    content = message.get("content")
+                    if isinstance(content, str) and content:
+                        return content
+
+    return ""
+
+
+def _extract_text_from_cloud_blob(blob: str) -> str:
+    text = str(blob or "").strip()
+    if not text:
+        return ""
+
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return ""
+
+    return _extract_text_from_cloud_payload(parsed)
+
+
+def _strip_starred_segments(text: str, preserve_edges: bool = False) -> str:
+    source = str(text or "")
+    if not source:
+        return ""
+
+    output_chars: List[str] = []
+    in_starred_segment = False
+    index = 0
+    length = len(source)
+
+    while index < length:
+        char = source[index]
+        if char == "*":
+            while index < length and source[index] == "*":
+                index += 1
+            in_starred_segment = not in_starred_segment
+            continue
+
+        if not in_starred_segment:
+            output_chars.append(char)
+        index += 1
+
+    cleaned = "".join(output_chars)
+    cleaned = re.sub(r"[ \t]+", " ", cleaned)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    return cleaned if preserve_edges else cleaned.strip()
+
+
+def _hard_clean_text(text: str, preserve_edges: bool = False) -> str:
+    cleaned = _strip_starred_segments(str(text or ""), preserve_edges=True)
+    if not cleaned:
+        return ""
+
+    for pattern in HARD_CLEAN_PATTERNS:
+        cleaned = pattern.sub("", cleaned)
+
+    # If upstream outputs a mostly space-less stream, recover likely word boundaries.
+    if wordninja is not None:
+        alpha_chars = sum(ch.isalpha() for ch in cleaned)
+        space_chars = cleaned.count(" ")
+        if alpha_chars >= 20 and space_chars <= max(1, alpha_chars // 24):
+            def _split_glued_run(match: re.Match) -> str:
+                token = match.group(0)
+                parts = wordninja.split(token)
+                if len(parts) <= 1:
+                    return token
+                return " ".join(parts)
+
+            cleaned = GLUED_ALPHA_RUN_REGEX.sub(_split_glued_run, cleaned)
+
+    cleaned = CAMEL_BOUNDARY_REGEX.sub(r"\1 \2", cleaned)
+    cleaned = re.sub(r"([.!?])([A-Za-z])", r"\1 \2", cleaned)
+    cleaned = re.sub(r"([,;:])([A-Za-z])", r"\1 \2", cleaned)
+    cleaned = re.sub(r"\b(\w+)\s+\1\b", r"\1", cleaned, flags=re.IGNORECASE)
+    cleaned = WHITESPACE_REGEX.sub(" ", cleaned)
+    return cleaned if preserve_edges else cleaned.strip()
+
+
+def _normalize_polished_cloud_text(text: str, preserve_edges: bool = False) -> str:
+    normalized = _strip_starred_segments(str(text or ""), preserve_edges=True)
+    if not normalized:
+        return ""
+
+    normalized = normalized.replace("\r", "")
+    normalized = re.sub(r"[ \t]+", " ", normalized)
+    return normalized if preserve_edges else normalized.strip()
+
+
+def _normalize_cloud_stream_piece(piece: str) -> str:
+    text = str(piece or "")
+    if not text.strip():
+        return ""
+
+    if TRUST_CLOUD_POLISHED_RESPONSE:
+        extracted = _extract_text_from_cloud_blob(text)
+        if extracted:
+            text = extracted
+        return _normalize_polished_cloud_text(text, preserve_edges=True)
+
+    # If a full JSON object arrives as a single chunk, unwrap it to assistant text.
+    extracted = _extract_text_from_cloud_blob(text)
+    if extracted:
+        return _hard_clean_text(extracted, preserve_edges=True)
+
+    response_match = re.search(
+        r'"response"\s*:\s*"((?:\\.|[^"\\])*)"',
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if response_match:
+        escaped_value = response_match.group(1)
+        try:
+            text = json.loads(f'"{escaped_value}"')
+        except ValueError:
+            text = escaped_value.replace("\\n", "\n").replace('\\"', '"')
+
+    text = re.sub(
+        r"Reflecting feelings, then asking ONE follow-up question\.?",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\bReflecting\s*feelings?\b.*$", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\bthen asking(?:\s+one)?\s+follow-?up\s+question\b.*$", "", text, flags=re.IGNORECASE)
+    text = re.split(r"\bUser:|\bAssistant:", text, maxsplit=1, flags=re.IGNORECASE)[0]
+    return _hard_clean_text(text, preserve_edges=True)
+
+
+def _sanitize_cloud_llm_response(text: str, max_words: int = 60) -> str:
+    if TRUST_CLOUD_POLISHED_RESPONSE:
+        direct = _extract_text_from_cloud_blob(str(text or "")) or str(text or "")
+        direct = _normalize_polished_cloud_text(direct)
+        if direct:
+            return direct
+        return "I am here with you. Let's take one small step together."
+
+    cleaned = _hard_clean_text(str(text or ""))
+    if not cleaned:
+        return "I am here with you. Let's take one small step together."
+
+    extracted_blob_text = _extract_text_from_cloud_blob(cleaned)
+    if extracted_blob_text:
+        cleaned = _hard_clean_text(extracted_blob_text)
+    else:
+        response_match = re.search(
+            r'"response"\s*:\s*"((?:\\.|[^"\\])*)"',
+            cleaned,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if response_match:
+            escaped_value = response_match.group(1)
+            try:
+                cleaned = json.loads(f'"{escaped_value}"')
+            except ValueError:
+                cleaned = escaped_value.replace("\\n", "\n").replace('\\"', '"')
+            cleaned = _hard_clean_text(cleaned)
+
+    # Remove explicit prompt-instruction leakage if the remote model echoes it.
+    cleaned = re.sub(
+        r"Reflecting feelings, then asking ONE follow-up question\.?",
+        "",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\bReflecting\s*feelings?\b.*$", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\bthen asking(?:\s+one)?\s+follow-?up\s+question\b.*$", "", cleaned, flags=re.IGNORECASE)
+
+    # Drop leaked chat transcript fragments like "User: ... Assistant: ...".
+    cleaned = re.split(r"\bUser:|\bAssistant:", cleaned, maxsplit=1, flags=re.IGNORECASE)[0]
+
+    # Normalize whitespace and strip markdown artifacts.
+    cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
+    cleaned = re.sub(
+        r"(?i)(is there anything specific you'd like to talk about\??)(?:\s+\1)+",
+        r"\1",
+        cleaned,
+    )
+
+    # Collapse repeated phrase loops produced by occasional cloud decoding glitches.
+    for n in (10, 8, 6, 5, 4):
+        previous = None
+        while cleaned != previous:
+            previous = cleaned
+            cleaned = re.sub(
+                rf"(?i)\b((?:[\w']+\W+){{{n - 1}}}[\w']+)(?:\W+\1\b)+",
+                r"\1",
+                cleaned,
+            )
+
+    cleaned = WHITESPACE_REGEX.sub(" ", cleaned).strip()
+
+    # Remove repeated sentences while preserving order.
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", cleaned) if part.strip()]
+    unique_sentences: List[str] = []
+    seen = set()
+    for sentence in sentences:
+        key = re.sub(r"\W+", "", sentence.lower())
+        if key and key in seen:
+            continue
+        if unique_sentences:
+            previous_key = re.sub(r"\W+", "", unique_sentences[-1].lower())
+            if previous_key and key:
+                overlap_ratio = min(len(previous_key), len(key)) / max(len(previous_key), len(key))
+                if overlap_ratio > 0.7 and (key in previous_key or previous_key in key):
+                    continue
+        if key:
+            seen.add(key)
+        unique_sentences.append(sentence)
+
+    cleaned = " ".join(unique_sentences).strip() if unique_sentences else cleaned
+
+    # Keep only the most meaningful short therapeutic response.
+    if unique_sentences:
+        cleaned = " ".join(unique_sentences[:3]).strip()
+
+    # Keep response concise for frontend UX.
+    words = cleaned.split()
+    if len(words) > max_words:
+        cleaned = " ".join(words[:max_words]).strip().rstrip(",;:") + "."
+
+    if not cleaned:
+        return "I am here with you. Let's take one small step together."
+
+    if cleaned[-1] not in ".!?":
+        cleaned = f"{cleaned}."
+
+    return cleaned
+
+
+def _compact_cloud_error(error: Exception) -> str:
+    raw = str(error or "").strip()
+    if not raw:
+        return "Cloud LLM unavailable"
+
+    simplified = raw.replace("\n", " ").replace("\r", " ").strip()
+    if "(Caused by" in simplified:
+        simplified = simplified.split("(Caused by", maxsplit=1)[0].strip()
+
+    simplified = WHITESPACE_REGEX.sub(" ", simplified).strip()
+    if len(simplified) > 220:
+        simplified = simplified[:217].rstrip() + "..."
+    return simplified or "Cloud LLM unavailable"
+
+
+def _drain_complete_sentences(buffer: str) -> Tuple[List[str], str]:
+    if not buffer:
+        return [], ""
+
+    segments = SENTENCE_BOUNDARY_REGEX.split(buffer)
+    if len(segments) <= 1:
+        return [], buffer
+
+    completed = [segment.strip() for segment in segments[:-1] if segment.strip()]
+    pending = segments[-1]
+    return completed, pending
+
+
 async def _generate_tts_base64(text: str) -> tuple[Optional[str], Optional[str]]:
+    global tts_consecutive_failures, tts_disabled_until_epoch
+
     if not text:
         return None, "TTS skipped: empty text"
+
+    if not TTS_ENABLED:
+        return None, "TTS disabled by configuration"
 
     if edge_tts is None:
         return None, "TTS unavailable: edge-tts is not installed"
 
+    now_epoch = time.time()
+    if now_epoch < tts_disabled_until_epoch:
+        remaining = int(tts_disabled_until_epoch - now_epoch)
+        return None, f"TTS temporarily disabled for {remaining}s after repeated failures"
+
     audio_path = None
     try:
         audio_path = os.path.join(tempfile.gettempdir(), f"serenity_tts_{uuid.uuid4().hex}.mp3")
-        communicator = edge_tts.Communicate(text=text, voice="en-US-JennyNeural", rate="+0%")
+        communicator = edge_tts.Communicate(
+            text=text,
+            voice=TTS_VOICE,
+            rate=TTS_RATE,
+            pitch=TTS_PITCH,
+        )
         await asyncio.wait_for(communicator.save(audio_path), timeout=TTS_TIMEOUT_SECONDS)
 
         with open(audio_path, "rb") as audio_file:
             encoded = base64.b64encode(audio_file.read()).decode("utf-8")
 
+        tts_consecutive_failures = 0
+        tts_disabled_until_epoch = 0.0
         return encoded, None
     except asyncio.TimeoutError:
+        tts_consecutive_failures += 1
+        if tts_consecutive_failures >= TTS_FAILURE_THRESHOLD:
+            tts_disabled_until_epoch = time.time() + TTS_COOLDOWN_SECONDS
+            LOGGER.warning(
+                "TTS disabled for %ss after %s consecutive failures.",
+                TTS_COOLDOWN_SECONDS,
+                tts_consecutive_failures,
+            )
         LOGGER.warning("TTS generation timed out after %s seconds", TTS_TIMEOUT_SECONDS)
-        return None, "TTS timeout"
+        return None, "TTS timeout. Returning text response only."
     except Exception as exc:
-        LOGGER.exception("TTS generation failed: %s", exc)
-        return None, f"TTS failed: {exc}"
+        tts_consecutive_failures += 1
+        if tts_consecutive_failures >= TTS_FAILURE_THRESHOLD:
+            tts_disabled_until_epoch = time.time() + TTS_COOLDOWN_SECONDS
+            LOGGER.warning(
+                "TTS disabled for %ss after %s consecutive failures.",
+                TTS_COOLDOWN_SECONDS,
+                tts_consecutive_failures,
+            )
+
+        failure_text = str(exc)
+        if "403" in failure_text:
+            LOGGER.warning("TTS service returned 403. Falling back to text response only.")
+            return None, "TTS service unavailable (HTTP 403). Returning text response only."
+
+        LOGGER.warning("TTS generation failed: %s", exc)
+        return None, f"TTS failed: {exc}. Returning text response only."
     finally:
         if audio_path and os.path.exists(audio_path):
             try:
@@ -269,26 +823,104 @@ async def _generate_tts_base64(text: str) -> tuple[Optional[str], Optional[str]]
                 pass
 
 
-def _transcribe_with_whisper(audio_path: str) -> tuple[str, Optional[str]]:
-    global whisper_model
+async def _warmup_edge_tts_once() -> None:
+    if not TTS_WARMUP_ENABLED or not TTS_ENABLED or edge_tts is None:
+        return
 
-    if whisper is None:
-        return "", "Whisper unavailable: package not installed"
+    if _state_get("tts_warmed_up", False):
+        return
 
-    if whisper_model is None:
-        try:
-            whisper_model = whisper.load_model("tiny", device="cpu")
-            LOGGER.info("Whisper tiny model loaded on CPU.")
-        except Exception as exc:
-            LOGGER.exception("Whisper load failed: %s", exc)
-            return "", f"Whisper load failed: {exc}"
+    warmup_text = os.getenv("SERENITY_TTS_WARMUP_TEXT", "Hello.").strip() or "Hello."
+    started = time.time()
+    _encoded_audio, tts_error = await _generate_tts_base64(warmup_text)
+    elapsed = time.time() - started
+
+    if tts_error:
+        LOGGER.warning("TTS warmup completed with warning after %.2fs: %s", elapsed, tts_error)
+    else:
+        LOGGER.info("TTS warmup completed in %.2fs", elapsed)
+
+    _state_set("tts_warmed_up", True)
+
+
+async def _warmup_cloud_llm_once() -> None:
+    cloud_llm_client = _state_get("cloud_llm_client")
+    if cloud_llm_client is None:
+        return
 
     try:
-        transcript = whisper_model.transcribe(audio_path, fp16=False, language="en")
-        text = str(transcript.get("text", "")).strip()
+        elapsed = await asyncio.wait_for(
+            run_in_threadpool(cloud_llm_client.warmup, CLOUD_LLM_WARMUP_TEXT),
+            timeout=CLOUD_LLM_WARMUP_TIMEOUT_SECONDS,
+        )
+        LOGGER.info("Cloud LLM warmup completed in %.2fs", elapsed)
+    except asyncio.TimeoutError:
+        LOGGER.warning(
+            "Cloud LLM warmup timed out after %ss",
+            CLOUD_LLM_WARMUP_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        LOGGER.warning("Cloud LLM warmup failed: %s", exc)
+
+
+def _transcribe_with_whisper(audio_path: str) -> tuple[str, Optional[str]]:
+    init_error = _ensure_whisper_runtime_sync()
+    if init_error and _state_get("whisper_model") is None:
+        return "", str(init_error)
+
+    whisper_model = _state_get("whisper_model")
+    whisper_device_in_use = _state_get("whisper_device_in_use", "cpu")
+    whisper_backend = _state_get("whisper_backend", "faster-whisper")
+
+    if whisper_model is None:
+        return "", "Whisper runtime unavailable"
+
+    try:
+        if whisper_backend == "faster-whisper":
+            segments, _info = whisper_model.transcribe(
+                audio_path,
+                language="en",
+                beam_size=1,
+                vad_filter=True,
+            )
+            text = " ".join([str(segment.text).strip() for segment in segments if str(segment.text).strip()]).strip()
+        else:
+            # Force fp16 off for openai-whisper to avoid NaN logits seen on some CUDA stacks.
+            use_fp16 = False
+            transcript = whisper_model.transcribe(audio_path, fp16=use_fp16, language="en")
+            text = str(transcript.get("text", "")).strip()
         return text, None
     except Exception as exc:
-        LOGGER.exception("Whisper transcription failed: %s", exc)
+        error_text = str(exc).lower()
+        unstable_logits = (
+            "nan" in error_text
+            or "categorical" in error_text
+            or "expected parameter logits" in error_text
+        )
+
+        if whisper_backend == "openai-whisper" and whisper_device_in_use == "cuda" and unstable_logits:
+            LOGGER.warning("OpenAI Whisper CUDA became unstable; retrying transcription with CPU whisper runtime.")
+            try:
+                cpu_whisper_model = _state_get("whisper_model_cpu")
+                if cpu_whisper_model is None:
+                    if openai_whisper is None:
+                        raise RuntimeError("openai-whisper package is unavailable for CPU retry")
+                    cpu_whisper_model = openai_whisper.load_model(WHISPER_MODEL_SIZE, device="cpu")
+                    _state_set("whisper_model_cpu", cpu_whisper_model)
+
+                cpu_transcript = cpu_whisper_model.transcribe(audio_path, fp16=False, language="en")
+                cpu_text = str(cpu_transcript.get("text", "")).strip()
+                return cpu_text, None
+            except Exception as cpu_exc:
+                LOGGER.exception("Whisper CPU retry failed after CUDA instability: %s", cpu_exc)
+                return "", f"Whisper transcription failed after CPU retry: {cpu_exc}"
+
+        LOGGER.exception(
+            "Whisper transcription failed on %s using %s: %s",
+            whisper_device_in_use,
+            whisper_backend,
+            exc,
+        )
         return "", f"Whisper transcription failed: {exc}"
 
 
@@ -296,154 +928,371 @@ async def _generate_llm_response(
     user_text: str,
     dominant_emotion: str,
     serialized_history: List[Dict[str, str]],
-) -> tuple[str, Optional[str]]:
-    if serenity_bot is None:
-        return "I am here with you. Let's take one small step together.", "RAG model unavailable"
+    username: str = "anonymous",
+    emotion_probabilities: Optional[Dict[str, Dict[str, float]]] = None,
+) -> tuple[str, Optional[str], List[str], List[str]]:
+    cloud_llm_client = _state_get("cloud_llm_client")
+    if cloud_llm_client is None:
+        init_error = _state_get("rag_init_error")
+        error_msg = "Cloud LLM client unavailable"
+        if init_error:
+            error_msg = f"Cloud LLM client unavailable: {init_error}"
+        return (
+            "I am here with you. Let's take one small step together.",
+            error_msg,
+            [],
+            [],
+        )
+
+    # user_text is the only field expected by the deployed EC2 /chat API.
+    _ = (dominant_emotion, serialized_history, username, emotion_probabilities)
 
     try:
         async with llm_generation_semaphore:
             response = await asyncio.wait_for(
-                run_in_threadpool(
-                    serenity_bot.generate_multimodal,
-                    user_text,
-                    dominant_emotion,
-                    serialized_history,
-                ),
+                run_in_threadpool(cloud_llm_client.ask_serenity, user_text),
                 timeout=LLM_TIMEOUT_SECONDS,
             )
-        return str(response), None
+        cleaned_response = _sanitize_cloud_llm_response(str(response))
+        return cleaned_response, None, [], []
     except asyncio.TimeoutError:
         LOGGER.warning("LLM generation timed out after %s seconds", LLM_TIMEOUT_SECONDS)
-        return "I am with you. Let's breathe slowly and focus on one manageable next step.", "LLM timeout"
+        return (
+            "I am with you. Let's breathe slowly and focus on one manageable next step.",
+            "LLM timeout. Using safe fallback response.",
+            [],
+            [],
+        )
     except Exception as exc:
-        LOGGER.exception("LLM generation failed: %s", exc)
-        return "I am here with you. Let's take one small step together.", f"LLM failed: {exc}"
+        if isinstance(exc, CloudLLMError):
+            LOGGER.warning("LLM generation failed: %s", _compact_cloud_error(exc))
+        else:
+            LOGGER.exception("LLM generation failed: %s", exc)
+        return (
+            "I am here with you. Let's take one small step together.",
+            "LLM generation failed. Using safe fallback response.",
+            [],
+            [],
+        )
 
 
-@app.on_event("startup")
-async def startup_event() -> None:
-    global serenity_bot, rag_init_task
+async def _stream_multimodal_generation(
+    username: str,
+    user_text: str,
+    dominant_emotion: str,
+    serialized_history: List[Dict[str, str]],
+    emotion_probabilities: Optional[Dict[str, Dict[str, float]]] = None,
+):
+    cloud_llm_client = _state_get("cloud_llm_client")
+    init_error = _state_get("rag_init_error")
 
-    async def _initialize_rag_background() -> None:
-        global serenity_bot
-        try:
-            serenity_bot = await run_in_threadpool(init_rag_system)
-            LOGGER.info("RAG system initialized successfully.")
-        except Exception as exc:
-            serenity_bot = None
-            LOGGER.exception("Failed to initialize RAG system in background: %s", exc)
-
-    if os.getenv("SERENITY_SKIP_RAG_STARTUP", "false").lower() == "true":
-        serenity_bot = None
-        LOGGER.warning("Skipping RAG startup initialization due to SERENITY_SKIP_RAG_STARTUP=true")
+    if cloud_llm_client is None:
+        errors = ["Cloud LLM client unavailable"]
+        if init_error:
+            errors = [f"Cloud LLM client unavailable: {init_error}"]
+        yield {
+            "type": "generation_result",
+            "llm_response": "I am here with you. Let's take one small step together.",
+            "errors": errors,
+        }
         return
 
-    # Keep API responsive immediately; load RAG asynchronously in background.
-    if rag_init_task is None or rag_init_task.done():
-        rag_init_task = asyncio.create_task(_initialize_rag_background())
-        LOGGER.info("RAG initialization started in background.")
+    # Current deployed cloud endpoint consumes only text.
+    _ = (username, dominant_emotion, serialized_history, emotion_probabilities)
 
+    loop = asyncio.get_running_loop()
+    chunk_queue: "asyncio.Queue[Optional[str]]" = asyncio.Queue()
 
-@app.on_event("shutdown")
-async def shutdown_event() -> None:
-    global rag_init_task
-    if rag_init_task is not None and not rag_init_task.done():
-        rag_init_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await rag_init_task
+    stream_sentence_tts_enabled = (
+        STREAM_TTS_SENTENCE_AUDIO
+        and TTS_STREAMING_ENABLED
+        and TTS_ENABLED
+        and edge_tts is not None
+    )
+    stream_sentence_tts_live = stream_sentence_tts_enabled and not STREAM_TTS_FINAL_TEXT_ONLY
+    emit_provisional_text = STREAM_PROVISIONAL_TEXT and STREAM_TOKEN_DELTA
+
+    def _producer() -> str:
+        full_text_parts: List[str] = []
+        try:
+            for chunk in cloud_llm_client.stream_serenity(user_text):
+                piece = str(chunk or "")
+                if not piece:
+                    continue
+                full_text_parts.append(piece)
+                loop.call_soon_threadsafe(chunk_queue.put_nowait, piece)
+        finally:
+            loop.call_soon_threadsafe(chunk_queue.put_nowait, None)
+        return "".join(full_text_parts)
+
+    generation_task = asyncio.create_task(
+        asyncio.wait_for(
+            run_in_threadpool(_producer),
+            timeout=LLM_TIMEOUT_SECONDS,
+        )
+    )
+
+    producer_done = False
+    stream_errors: List[str] = []
+    raw_stream_text = ""
+    display_text = ""
+    sentence_stream_buffer = ""
+    final_response = ""
+    sentence_sequence = 0
+    sentence_key_to_sequence: Dict[str, int] = {}
+
+    sentence_queue: Optional["asyncio.Queue[Optional[Tuple[int, str]]]"] = None
+    tts_event_queue: Optional["asyncio.Queue[Optional[Tuple[int, str, Optional[str], Optional[str]]]]"] = None
+    tts_worker_task: Optional[asyncio.Task] = None
+
+    def _sentence_key(text: str) -> str:
+        return re.sub(r"\W+", "", str(text or "").lower())
+
+    def _register_sentence(
+        sentence_text: str,
+        allow_existing: bool = False,
+    ) -> Optional[Tuple[int, str, bool]]:
+        nonlocal sentence_sequence
+        cleaned_sentence = _hard_clean_text(sentence_text)
+        if not cleaned_sentence:
+            return None
+
+        key = _sentence_key(cleaned_sentence)
+        if key:
+            existing_sequence = sentence_key_to_sequence.get(key)
+            if existing_sequence is not None:
+                if allow_existing:
+                    return existing_sequence, cleaned_sentence, False
+                return None
+
+        sentence_sequence += 1
+        if key:
+            sentence_key_to_sequence[key] = sentence_sequence
+        return sentence_sequence, cleaned_sentence, True
+
+    async def _tts_sentence_worker() -> None:
+        if sentence_queue is None or tts_event_queue is None:
+            return
+
+        while True:
+            item = await sentence_queue.get()
+            if item is None:
+                break
+
+            sequence, sentence_text = item
+            encoded_audio, tts_error = await _generate_tts_base64(sentence_text)
+            await tts_event_queue.put((sequence, sentence_text, encoded_audio, tts_error))
+
+        await tts_event_queue.put(None)
+
+    async def _drain_ready_tts_events() -> tuple[List[Dict[str, object]], List[str], bool]:
+        events: List[Dict[str, object]] = []
+        errors: List[str] = []
+        worker_done = False
+
+        if tts_event_queue is None:
+            return events, errors, worker_done
+
+        while not tts_event_queue.empty():
+            item = tts_event_queue.get_nowait()
+            if item is None:
+                worker_done = True
+                break
+
+            sequence, sentence_text, encoded_audio, tts_error = item
+            if encoded_audio:
+                events.append(
+                    {
+                        "type": "assistant_sentence_tts",
+                        "text": sentence_text,
+                        "sequence": sequence,
+                        "audio_base64": encoded_audio,
+                    }
+                )
+            if tts_error:
+                errors.append(tts_error)
+
+        return events, errors, worker_done
+
+    if stream_sentence_tts_enabled:
+        sentence_queue = asyncio.Queue()
+        tts_event_queue = asyncio.Queue()
+        tts_worker_task = asyncio.create_task(_tts_sentence_worker())
+
+    try:
+        while True:
+            emitted = False
+
+            while not chunk_queue.empty():
+                piece = chunk_queue.get_nowait()
+                if piece is None:
+                    producer_done = True
+                    continue
+
+                piece = _normalize_cloud_stream_piece(str(piece))
+                if not piece:
+                    continue
+
+                raw_stream_text += piece
+
+                if TRUST_CLOUD_POLISHED_RESPONSE:
+                    candidate_text = _normalize_polished_cloud_text(raw_stream_text, preserve_edges=True)
+                else:
+                    candidate_text = _hard_clean_text(raw_stream_text, preserve_edges=True)
+                if not candidate_text or candidate_text == display_text:
+                    continue
+
+                if candidate_text.startswith(display_text):
+                    delta = candidate_text[len(display_text):]
+                    if stream_sentence_tts_live:
+                        sentence_stream_buffer += delta
+                else:
+                    delta = candidate_text
+                    if stream_sentence_tts_live:
+                        sentence_stream_buffer = candidate_text
+
+                display_text = candidate_text
+                if emit_provisional_text:
+                    yield {
+                        "type": "assistant_delta",
+                        "delta": delta,
+                        "text": display_text,
+                    }
+                    emitted = True
+
+                if stream_sentence_tts_live:
+                    completed_sentences, sentence_stream_buffer = _drain_complete_sentences(sentence_stream_buffer)
+                    for sentence_text in completed_sentences:
+                        registered = _register_sentence(sentence_text)
+                        if registered is None:
+                            continue
+
+                        sequence, cleaned_sentence, _is_new = registered
+                        yield {
+                            "type": "assistant_sentence",
+                            "text": cleaned_sentence,
+                            "sequence": sequence,
+                        }
+                        emitted = True
+
+                        if sentence_queue is not None:
+                            await sentence_queue.put((sequence, cleaned_sentence))
+
+            tts_events, tts_errors, _worker_done = await _drain_ready_tts_events()
+            for event in tts_events:
+                yield event
+                emitted = True
+            if tts_errors:
+                stream_errors.extend(tts_errors)
+
+            if producer_done and chunk_queue.empty() and generation_task.done():
+                break
+
+            if not emitted:
+                await asyncio.sleep(0.01)
+
+        producer_final_text = str(await generation_task or "").strip()
+        if not raw_stream_text:
+            raw_stream_text = producer_final_text
+        final_response = _sanitize_cloud_llm_response(producer_final_text or display_text or raw_stream_text)
+    except asyncio.TimeoutError:
+        generation_task.cancel()
+        with contextlib.suppress(Exception):
+            await generation_task
+        LOGGER.warning("Streaming LLM generation timed out after %s seconds", LLM_TIMEOUT_SECONDS)
+        stream_errors.append("LLM timeout. Returning partial response.")
+        final_response = _sanitize_cloud_llm_response(display_text or raw_stream_text)
+        if not final_response:
+            final_response = "I am with you. Let's breathe slowly and focus on one manageable next step."
+    except Exception as exc:
+        generation_task.cancel()
+        with contextlib.suppress(Exception):
+            await generation_task
+        if isinstance(exc, CloudLLMError):
+            LOGGER.warning("Streaming LLM generation failed: %s", _compact_cloud_error(exc))
+        else:
+            LOGGER.exception("Streaming LLM generation failed: %s", exc)
+        stream_errors.append(f"LLM generation failed: {_compact_cloud_error(exc)}")
+        final_response = _sanitize_cloud_llm_response(display_text or raw_stream_text)
+        if not final_response:
+            final_response = "I am here with you. Let's take one small step together."
+
+    display_text = display_text.strip()
+    final_response = _sanitize_cloud_llm_response(final_response or display_text or raw_stream_text)
+    if final_response and (final_response != display_text or not emit_provisional_text):
+        yield {
+            "type": "assistant_replace",
+            "text": final_response,
+        }
+
+    # Ensure TTS playback aligns with the finalized assistant response text.
+    if stream_sentence_tts_enabled and final_response:
+        if STREAM_TTS_FINAL_TEXT_ONLY:
+            # Instruct clients to stop any previously queued/playing provisional audio.
+            yield {"type": "assistant_tts_reset"}
+
+        final_sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", final_response) if part.strip()]
+        final_sentence_sequences: List[int] = []
+        for sentence_text in final_sentences:
+            registered = _register_sentence(sentence_text, allow_existing=True)
+            if registered is None:
+                continue
+
+            sequence, cleaned_sentence, is_new = registered
+            final_sentence_sequences.append(sequence)
+            if is_new:
+                yield {
+                    "type": "assistant_sentence",
+                    "text": cleaned_sentence,
+                    "sequence": sequence,
+                }
+                if sentence_queue is not None:
+                    await sentence_queue.put((sequence, cleaned_sentence))
+
+        # Live TTS can begin early; once final polishing is known, trim queued/playing
+        # audio to the finalized sentence boundary.
+        if stream_sentence_tts_live and final_sentence_sequences:
+            yield {
+                "type": "assistant_tts_trim",
+                "max_sequence": max(final_sentence_sequences),
+            }
+
+    if sentence_queue is not None:
+        await sentence_queue.put(None)
+
+    if tts_worker_task is not None:
+        worker_completed = False
+        while not worker_completed:
+            tts_events, tts_errors, worker_done = await _drain_ready_tts_events()
+            for event in tts_events:
+                yield event
+            if tts_errors:
+                stream_errors.extend(tts_errors)
+
+            if worker_done:
+                worker_completed = True
+                break
+
+            if tts_worker_task.done() and (tts_event_queue is None or tts_event_queue.empty()):
+                worker_completed = True
+                break
+
+            await asyncio.sleep(0.01)
+
+        with contextlib.suppress(Exception):
+            await tts_worker_task
+
+    deduped_errors = list(dict.fromkeys([err for err in stream_errors if err]))
+    yield {
+        "type": "generation_result",
+        "llm_response": final_response,
+        "errors": deduped_errors,
+    }
 
 
 @app.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    return HealthResponse(status="running", rag_loaded=serenity_bot is not None)
-
-
-@app.post("/detect_emotion", response_model=EmotionAnalysisResponse)
-async def detect_emotion(payload: DetectEmotionRequest) -> EmotionAnalysisResponse:
-    if not payload.image:
-        raise HTTPException(status_code=400, detail="Missing image payload.")
-
-    try:
-        prediction = await run_in_threadpool(analyze_face, payload.image)
-        emotion, confidence, inference_error = _normalize_prediction(prediction)
-    except Exception as exc:
-        LOGGER.exception("Face emotion inference failed: %s", exc)
-        raise HTTPException(status_code=500, detail="Face emotion inference failed.") from exc
-
-    ai_message = ""
-    if serenity_bot is not None:
-        try:
-            prompt_message = payload.user_message or f"I am feeling {emotion}"
-            ai_message = await run_in_threadpool(
-                serenity_bot.generate,
-                prompt_message,
-                emotion,
-            )
-        except Exception as exc:
-            LOGGER.exception("LLM generation failed for face path: %s", exc)
-            ai_message = "I am here with you."
-
-    return EmotionAnalysisResponse(
-        emotion=str(emotion),
-        confidence=float(confidence),
-        ai_message=ai_message,
-        error=inference_error,
-    )
-
-
-@app.post("/analyze_audio", response_model=EmotionAnalysisResponse)
-async def analyze_audio(
-    file: UploadFile = File(...),
-    user_message: Optional[str] = Form(default=None),
-) -> EmotionAnalysisResponse:
-    if file is None:
-        raise HTTPException(status_code=400, detail="No audio file provided.")
-
-    temp_audio_path: Optional[str] = None
-    try:
-        audio_bytes = await file.read()
-        if not audio_bytes:
-            raise HTTPException(status_code=400, detail="Empty audio upload.")
-
-        # Unique temp path per request prevents cross-request overwrite races.
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
-            temp_audio.write(audio_bytes)
-            temp_audio_path = temp_audio.name
-
-        prediction = await run_in_threadpool(predict_audio_emotion, temp_audio_path)
-        emotion, confidence, inference_error = _normalize_prediction(prediction)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        LOGGER.exception("Audio emotion inference failed: %s", exc)
-        raise HTTPException(status_code=500, detail="Audio emotion inference failed.") from exc
-    finally:
-        await file.close()
-        if temp_audio_path and os.path.exists(temp_audio_path):
-            try:
-                os.remove(temp_audio_path)
-            except OSError as exc:
-                LOGGER.warning("Failed to remove temp audio file %s: %s", temp_audio_path, exc)
-
-    ai_message = "I hear you."
-    if serenity_bot is not None:
-        try:
-            prompt_message = user_message or f"I am speaking in a {emotion} tone"
-            ai_message = await run_in_threadpool(
-                serenity_bot.generate,
-                prompt_message,
-                emotion,
-            )
-        except Exception as exc:
-            LOGGER.exception("LLM generation failed for audio path: %s", exc)
-            ai_message = "Thank you for sharing that with me."
-
-    return EmotionAnalysisResponse(
-        emotion=str(emotion),
-        confidence=float(confidence),
-        ai_message=ai_message,
-        error=inference_error,
-    )
+    return HealthResponse(status="running", rag_loaded=_state_get("cloud_llm_client") is not None)
 
 
 @app.post("/api/interact", response_model=InteractResponse)
@@ -455,8 +1304,8 @@ async def interact(
 ) -> InteractResponse:
     if not username:
         raise HTTPException(status_code=400, detail="Missing username.")
-    if not image and file is None and not user_message:
-        raise HTTPException(status_code=400, detail="Provide at least one of image, audio, or text.")
+    if file is None:
+        raise HTTPException(status_code=400, detail="Microphone input is required for interaction.")
 
     errors: List[str] = []
     temp_audio_path: Optional[str] = None
@@ -468,49 +1317,52 @@ async def interact(
     face_emotion = "Neutral"
     face_confidence = 0.0
     transcription = ""
+    speech_probs: Dict[str, float] = _to_probability_vector("Neutral", 0.0)
+    face_probs: Optional[Dict[str, float]] = None
+    fused_probs: Dict[str, float] = speech_probs
 
     try:
         tasks: List[tuple[str, asyncio.Future]] = []
 
         if file is not None:
             audio_bytes = await file.read()
-            if audio_bytes:
-                suffix = ".wav"
-                filename = (file.filename or "").lower()
-                if filename.endswith(".webm"):
-                    suffix = ".webm"
-                elif filename.endswith(".mp3"):
-                    suffix = ".mp3"
+            if not audio_bytes:
+                raise HTTPException(status_code=400, detail="Audio upload was empty.")
 
-                with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_audio:
-                    temp_audio.write(audio_bytes)
-                    temp_audio_path = temp_audio.name
-                    audio_available = True
+            suffix = ".wav"
+            filename = (file.filename or "").lower()
+            if filename.endswith(".webm"):
+                suffix = ".webm"
+            elif filename.endswith(".mp3"):
+                suffix = ".mp3"
 
-                tasks.append(
-                    (
-                        "transcribe",
-                        asyncio.create_task(
-                            asyncio.wait_for(
-                                run_in_threadpool(_transcribe_with_whisper, temp_audio_path),
-                                timeout=WHISPER_TIMEOUT_SECONDS,
-                            )
-                        ),
-                    )
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_audio:
+                temp_audio.write(audio_bytes)
+                temp_audio_path = temp_audio.name
+                audio_available = True
+
+            tasks.append(
+                (
+                    "transcribe",
+                    asyncio.create_task(
+                        asyncio.wait_for(
+                            run_in_threadpool(_transcribe_with_whisper, temp_audio_path),
+                            timeout=WHISPER_TIMEOUT_SECONDS,
+                        )
+                    ),
                 )
-                tasks.append(
-                    (
-                        "speech",
-                        asyncio.create_task(
-                            asyncio.wait_for(
-                                run_in_threadpool(predict_audio_emotion, temp_audio_path),
-                                timeout=EMOTION_TIMEOUT_SECONDS,
-                            )
-                        ),
-                    )
+            )
+            tasks.append(
+                (
+                    "speech",
+                    asyncio.create_task(
+                        asyncio.wait_for(
+                                run_in_threadpool(predict_audio_emotion, temp_audio_path, _state_get("speech_runtime")),
+                            timeout=EMOTION_TIMEOUT_SECONDS,
+                        )
+                    ),
                 )
-            else:
-                errors.append("Audio upload was empty.")
+            )
 
         if image:
             tasks.append(
@@ -518,7 +1370,7 @@ async def interact(
                     "face",
                     asyncio.create_task(
                         asyncio.wait_for(
-                            run_in_threadpool(analyze_face, image),
+                                run_in_threadpool(analyze_face, image, _state_get("face_runtime")),
                             timeout=EMOTION_TIMEOUT_SECONDS,
                         )
                     ),
@@ -547,6 +1399,7 @@ async def interact(
                         errors.append(f"Speech emotion failed: {result}")
                     else:
                         speech_emotion, speech_confidence, speech_error = _normalize_prediction(result)
+                        speech_probs = _to_probability_vector(speech_emotion, speech_confidence)
                         if speech_error:
                             errors.append(f"Speech model: {speech_error}")
 
@@ -557,38 +1410,66 @@ async def interact(
                         errors.append(f"Face emotion failed: {result}")
                     else:
                         face_emotion, face_confidence, face_error = _normalize_prediction(result)
+                        face_probs = _to_probability_vector(face_emotion, face_confidence)
                         if face_error:
                             errors.append(f"Face model: {face_error}")
 
         if audio_available and image_available:
-            dominant_emotion = _fuse_emotions(
-                speech_emotion=speech_emotion,
-                speech_confidence=speech_confidence,
-                face_emotion=face_emotion,
-                face_confidence=face_confidence,
+            face_probs = face_probs or _to_probability_vector(face_emotion, face_confidence)
+            fused_probs = _fuse_probability_vectors(
+                speech_probs=speech_probs,
+                face_probs=face_probs,
             )
+            dominant_emotion = _dominant_from_probabilities(fused_probs)
         elif audio_available:
-            dominant_emotion = str(speech_emotion).title()
+            fused_probs = speech_probs
+            dominant_emotion = _dominant_from_probabilities(fused_probs)
         elif image_available:
-            dominant_emotion = str(face_emotion).title()
+            face_probs = face_probs or _to_probability_vector(face_emotion, face_confidence)
+            fused_probs = face_probs
+            dominant_emotion = _dominant_from_probabilities(fused_probs)
         else:
             dominant_emotion = "Neutral"
 
-        user_text = (transcription or user_message or "I need help.").strip()
-        llm_response = "I am here with you. Let's take one small step together."
+        emotion_probabilities: Dict[str, Dict[str, float]] = {
+            "speech": speech_probs,
+            "fused": fused_probs,
+        }
+        if face_probs is not None:
+            emotion_probabilities["face"] = face_probs
+
+        user_text = (transcription or user_message or "").strip()
+        if not user_text:
+            errors.append("No speech transcription detected. Please try speaking again.")
+            errors = list(dict.fromkeys(errors))
+            return InteractResponse(
+                dominant_emotion=dominant_emotion,
+                speech_emotion=str(speech_emotion),
+                face_emotion=str(face_emotion),
+                transcription="",
+                llm_response="",
+                tts_audio_base64=None,
+                tts_audio_segments_base64=[],
+                errors=errors,
+            )
+        llm_response = ""
 
         db = SessionLocal()
         try:
             history_turns = fetch_recent_turns(db, username=username, limit=6)
             serialized_history = _serialize_turns(history_turns)
 
-            llm_response, llm_error = await _generate_llm_response(
+            llm_response, llm_error, tts_audio_segments, stream_tts_errors = await _generate_llm_response(
                 user_text=user_text,
                 dominant_emotion=dominant_emotion,
                 serialized_history=serialized_history,
+                username=username,
+                emotion_probabilities=emotion_probabilities,
             )
             if llm_error:
                 errors.append(llm_error)
+            if stream_tts_errors:
+                errors.extend(stream_tts_errors)
 
             try:
                 persist_turn(
@@ -606,9 +1487,13 @@ async def interact(
         finally:
             db.close()
 
-        tts_audio_base64, tts_error = await _generate_tts_base64(llm_response)
-        if tts_error:
-            errors.append(tts_error)
+        tts_audio_base64: Optional[str] = None
+        if not tts_audio_segments and not stream_tts_errors:
+            tts_audio_base64, tts_error = await _generate_tts_base64(llm_response)
+            if tts_error:
+                errors.append(tts_error)
+
+        errors = list(dict.fromkeys(errors))
 
         return InteractResponse(
             dominant_emotion=dominant_emotion,
@@ -617,6 +1502,7 @@ async def interact(
             transcription=user_text,
             llm_response=llm_response,
             tts_audio_base64=tts_audio_base64,
+            tts_audio_segments_base64=tts_audio_segments,
             errors=errors,
         )
     except HTTPException:
@@ -634,6 +1520,243 @@ async def interact(
                 LOGGER.warning("Failed to remove temp interaction audio %s: %s", temp_audio_path, exc)
 
 
+@app.post("/api/interact/stream")
+async def interact_stream(
+    username: str = Form(...),
+    image: Optional[str] = Form(default=None),
+    file: Optional[UploadFile] = File(default=None),
+    user_message: Optional[str] = Form(default=None),
+):
+    if not username:
+        raise HTTPException(status_code=400, detail="Missing username.")
+    if file is None:
+        raise HTTPException(status_code=400, detail="Microphone input is required for interaction.")
+
+    audio_bytes = await file.read()
+    await file.close()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Audio upload was empty.")
+
+    suffix = ".wav"
+    filename = (file.filename or "").lower()
+    if filename.endswith(".webm"):
+        suffix = ".webm"
+    elif filename.endswith(".mp3"):
+        suffix = ".mp3"
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_audio:
+        temp_audio.write(audio_bytes)
+        temp_audio_path = temp_audio.name
+
+    async def event_stream():
+        errors: List[str] = []
+        speech_emotion = "Neutral"
+        speech_confidence = 0.0
+        face_emotion = "Neutral"
+        face_confidence = 0.0
+        transcription = ""
+        speech_probs: Dict[str, float] = _to_probability_vector("Neutral", 0.0)
+        face_probs: Optional[Dict[str, float]] = None
+        fused_probs: Dict[str, float] = speech_probs
+
+        async def _named_task(name: str, coro):
+            try:
+                result = await coro
+                return name, result, None
+            except Exception as exc:
+                return name, None, exc
+
+        tasks = [
+            asyncio.create_task(
+                _named_task(
+                    "transcribe",
+                    asyncio.wait_for(
+                        run_in_threadpool(_transcribe_with_whisper, temp_audio_path),
+                        timeout=WHISPER_TIMEOUT_SECONDS,
+                    ),
+                )
+            ),
+            asyncio.create_task(
+                _named_task(
+                    "speech",
+                    asyncio.wait_for(
+                        run_in_threadpool(predict_audio_emotion, temp_audio_path, _state_get("speech_runtime")),
+                        timeout=EMOTION_TIMEOUT_SECONDS,
+                    ),
+                )
+            ),
+        ]
+
+        if image:
+            tasks.append(
+                asyncio.create_task(
+                    _named_task(
+                        "face",
+                        asyncio.wait_for(
+                            run_in_threadpool(analyze_face, image, _state_get("face_runtime")),
+                            timeout=EMOTION_TIMEOUT_SECONDS,
+                        ),
+                    )
+                )
+            )
+
+        try:
+            for completed in asyncio.as_completed(tasks):
+                name, result, task_error = await completed
+
+                if task_error is not None:
+                    message = str(task_error)
+                    if name == "transcribe":
+                        errors.append(f"Transcription failed: {message}")
+                    elif name == "speech":
+                        errors.append(f"Speech emotion failed: {message}")
+                    elif name == "face":
+                        errors.append(f"Face emotion failed: {message}")
+                    yield _to_ndjson_event({"type": "error", "message": errors[-1]})
+                    continue
+
+                if name == "transcribe":
+                    transcription, transcribe_error = result
+                    if transcribe_error:
+                        errors.append(transcribe_error)
+                        yield _to_ndjson_event({"type": "error", "message": transcribe_error})
+                    yield _to_ndjson_event(
+                        {
+                            "type": "transcription",
+                            "text": transcription,
+                        }
+                    )
+
+                if name == "speech":
+                    speech_emotion, speech_confidence, speech_error = _normalize_prediction(result)
+                    speech_probs = _to_probability_vector(speech_emotion, speech_confidence)
+                    if speech_error:
+                        errors.append(f"Speech model: {speech_error}")
+                        yield _to_ndjson_event({"type": "error", "message": errors[-1]})
+                    yield _to_ndjson_event(
+                        {
+                            "type": "emotion_partial",
+                            "speech_emotion": str(speech_emotion),
+                            "speech_confidence": float(speech_confidence),
+                        }
+                    )
+
+                if name == "face":
+                    face_emotion, face_confidence, face_error = _normalize_prediction(result)
+                    face_probs = _to_probability_vector(face_emotion, face_confidence)
+                    if face_error:
+                        errors.append(f"Face model: {face_error}")
+                        yield _to_ndjson_event({"type": "error", "message": errors[-1]})
+                    yield _to_ndjson_event(
+                        {
+                            "type": "emotion_partial",
+                            "face_emotion": str(face_emotion),
+                            "face_confidence": float(face_confidence),
+                        }
+                    )
+
+            if image:
+                face_probs = face_probs or _to_probability_vector(face_emotion, face_confidence)
+                fused_probs = _fuse_probability_vectors(speech_probs=speech_probs, face_probs=face_probs)
+                dominant_emotion = _dominant_from_probabilities(fused_probs)
+            else:
+                fused_probs = speech_probs
+                dominant_emotion = _dominant_from_probabilities(fused_probs)
+
+            emotion_probabilities: Dict[str, Dict[str, float]] = {
+                "speech": speech_probs,
+                "fused": fused_probs,
+            }
+            if face_probs is not None:
+                emotion_probabilities["face"] = face_probs
+
+            yield _to_ndjson_event(
+                {
+                    "type": "emotion",
+                    "dominant_emotion": dominant_emotion,
+                    "speech_emotion": str(speech_emotion),
+                    "face_emotion": str(face_emotion),
+                }
+            )
+
+            user_text = (transcription or user_message or "").strip()
+            if not user_text:
+                message = "No speech transcription detected. Please try speaking again."
+                errors.append(message)
+                yield _to_ndjson_event({"type": "error", "message": message})
+                yield _to_ndjson_event(
+                    {
+                        "type": "final",
+                        "llm_response": "",
+                        "transcription": "",
+                        "dominant_emotion": dominant_emotion,
+                        "speech_emotion": str(speech_emotion),
+                        "face_emotion": str(face_emotion),
+                    }
+                )
+                return
+            yield _to_ndjson_event({"type": "user_text", "text": user_text, "source": "voice"})
+
+            db = SessionLocal()
+            llm_response = ""
+            try:
+                history_turns = fetch_recent_turns(db, username=username, limit=6)
+                serialized_history = _serialize_turns(history_turns)
+
+                stream = _stream_multimodal_generation(
+                    username=username,
+                    user_text=user_text,
+                    dominant_emotion=dominant_emotion,
+                    serialized_history=serialized_history,
+                    emotion_probabilities=emotion_probabilities,
+                )
+
+                async for event in stream:
+                    if event.get("type") == "generation_result":
+                        llm_response = str(event.get("llm_response") or llm_response)
+                        llm_response = _sanitize_cloud_llm_response(llm_response)
+                        llm_errors = event.get("errors") or []
+                        errors.extend([str(item) for item in llm_errors if item])
+                        continue
+                    yield _to_ndjson_event(event)
+
+                try:
+                    persist_turn(
+                        db,
+                        username=username,
+                        user_text=user_text,
+                        assistant_text=llm_response,
+                        dominant_emotion=dominant_emotion,
+                        speech_emotion=str(speech_emotion),
+                        face_emotion=str(face_emotion),
+                    )
+                except Exception as exc:
+                    LOGGER.exception("Failed to persist streaming interaction turn: %s", exc)
+                    errors.append(f"DB log failed: {exc}")
+            finally:
+                db.close()
+
+            for message in list(dict.fromkeys(errors)):
+                yield _to_ndjson_event({"type": "error", "message": message})
+
+            yield _to_ndjson_event(
+                {
+                    "type": "final",
+                    "llm_response": llm_response,
+                    "transcription": user_text,
+                    "dominant_emotion": dominant_emotion,
+                    "speech_emotion": str(speech_emotion),
+                    "face_emotion": str(face_emotion),
+                }
+            )
+        finally:
+            if os.path.exists(temp_audio_path):
+                with contextlib.suppress(OSError):
+                    os.remove(temp_audio_path)
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")
+
+
 @app.post("/api/chat", response_model=InteractResponse)
 async def chat(payload: ChatRequest) -> InteractResponse:
     username = (payload.username or "").strip()
@@ -645,20 +1768,23 @@ async def chat(payload: ChatRequest) -> InteractResponse:
 
     errors: List[str] = []
     dominant_emotion = "Neutral"
-    llm_response = "I am here with you."
+    llm_response = ""
 
     db = SessionLocal()
     try:
         history_turns = fetch_recent_turns(db, username=username, limit=8)
         serialized_history = _serialize_turns(history_turns)
 
-        llm_response, llm_error = await _generate_llm_response(
+        llm_response, llm_error, tts_audio_segments, stream_tts_errors = await _generate_llm_response(
             user_text=user_text,
             dominant_emotion=dominant_emotion,
             serialized_history=serialized_history,
+            username=username,
         )
         if llm_error:
             errors.append(llm_error)
+        if stream_tts_errors:
+            errors.extend(stream_tts_errors)
 
         try:
             persist_turn(
@@ -676,9 +1802,13 @@ async def chat(payload: ChatRequest) -> InteractResponse:
     finally:
         db.close()
 
-    tts_audio_base64, tts_error = await _generate_tts_base64(llm_response)
-    if tts_error:
-        errors.append(tts_error)
+    tts_audio_base64: Optional[str] = None
+    if not tts_audio_segments and not stream_tts_errors:
+        tts_audio_base64, tts_error = await _generate_tts_base64(llm_response)
+        if tts_error:
+            errors.append(tts_error)
+
+    errors = list(dict.fromkeys(errors))
 
     return InteractResponse(
         dominant_emotion=dominant_emotion,
@@ -687,5 +1817,85 @@ async def chat(payload: ChatRequest) -> InteractResponse:
         transcription=user_text,
         llm_response=llm_response,
         tts_audio_base64=tts_audio_base64,
+        tts_audio_segments_base64=tts_audio_segments,
         errors=errors,
     )
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(payload: ChatRequest):
+    username = (payload.username or "").strip()
+    user_text = (payload.message or "").strip()
+    if not username:
+        raise HTTPException(status_code=400, detail="Missing username.")
+    if not user_text:
+        raise HTTPException(status_code=400, detail="Message cannot be empty.")
+
+    async def event_stream():
+        errors: List[str] = []
+        dominant_emotion = "Neutral"
+
+        yield _to_ndjson_event({"type": "user_text", "text": user_text, "source": "text"})
+        yield _to_ndjson_event(
+            {
+                "type": "emotion",
+                "dominant_emotion": dominant_emotion,
+                "speech_emotion": "Neutral",
+                "face_emotion": "Neutral",
+            }
+        )
+
+        db = SessionLocal()
+        llm_response = ""
+        try:
+            history_turns = fetch_recent_turns(db, username=username, limit=8)
+            serialized_history = _serialize_turns(history_turns)
+
+            stream = _stream_multimodal_generation(
+                username=username,
+                user_text=user_text,
+                dominant_emotion=dominant_emotion,
+                serialized_history=serialized_history,
+                emotion_probabilities=None,
+            )
+
+            async for event in stream:
+                if event.get("type") == "generation_result":
+                    llm_response = str(event.get("llm_response") or llm_response)
+                    llm_response = _sanitize_cloud_llm_response(llm_response)
+                    llm_errors = event.get("errors") or []
+                    errors.extend([str(item) for item in llm_errors if item])
+                    continue
+                yield _to_ndjson_event(event)
+
+            try:
+                persist_turn(
+                    db,
+                    username=username,
+                    user_text=user_text,
+                    assistant_text=llm_response,
+                    dominant_emotion=dominant_emotion,
+                    speech_emotion="Neutral",
+                    face_emotion="Neutral",
+                )
+            except Exception as exc:
+                LOGGER.exception("Failed to persist streaming chat turn: %s", exc)
+                errors.append(f"DB log failed: {exc}")
+        finally:
+            db.close()
+
+        for message in list(dict.fromkeys(errors)):
+            yield _to_ndjson_event({"type": "error", "message": message})
+
+        yield _to_ndjson_event(
+            {
+                "type": "final",
+                "llm_response": llm_response,
+                "transcription": user_text,
+                "dominant_emotion": dominant_emotion,
+                "speech_emotion": "Neutral",
+                "face_emotion": "Neutral",
+            }
+        )
+
+    return StreamingResponse(event_stream(), media_type="application/x-ndjson")

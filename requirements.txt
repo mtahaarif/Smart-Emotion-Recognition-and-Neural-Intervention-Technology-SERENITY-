@@ -11,7 +11,9 @@ librosa==0.10.1
 tensorflow==2.18.0
 tensorflow-intel==2.18.0
 torch==2.1.0
-transformers==4.36.0
+transformers==4.45.2
+accelerate==1.0.1
+huggingface_hub==0.25.2
 bitsandbytes==0.45.2
 sentence-transformers==2.2.2
 faiss-cpu==1.7.4
@@ -19,5 +21,7 @@ beautifulsoup4==4.12.2
 requests==2.31.0
 Pillow==10.1.0
 setuptools==70.0.0
-openai-whisper==20240930
+faster-whisper==1.1.1
 edge-tts==6.1.12
+boto3==1.35.99
+wordninja==2.0.0
