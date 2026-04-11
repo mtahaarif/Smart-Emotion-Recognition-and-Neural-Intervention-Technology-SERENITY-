@@ -1,6 +1,7 @@
 import base64
 import logging
 import os
+import threading
 from typing import Any, Dict, Optional
 
 import cv2
@@ -21,10 +22,20 @@ DEFAULT_TFLITE_THREADS = max(1, (os.cpu_count() or 4) // 2)
 FER_MAX_FRAME_SIDE = int(os.getenv("SERENITY_FER_MAX_FRAME_SIDE", "640"))
 FER_FACE_SCALE_FACTOR = float(os.getenv("SERENITY_FER_FACE_SCALE_FACTOR", "1.2"))
 FER_FACE_MIN_NEIGHBORS = int(os.getenv("SERENITY_FER_FACE_MIN_NEIGHBORS", "5"))
+FER_FACE_MIN_SIZE = int(os.getenv("SERENITY_FER_FACE_MIN_SIZE", "48"))
+FER_CV2_THREADS = int(os.getenv("SERENITY_FER_CV2_THREADS", "1"))
 
 LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_RUNTIME: Optional[Dict[str, Any]] = None
+_RUNTIME_LOCK = threading.Lock()
+
+if FER_CV2_THREADS > 0:
+    try:
+        cv2.setNumThreads(FER_CV2_THREADS)
+    except Exception:
+        # Best effort only; some builds may not expose thread controls.
+        pass
 
 
 def _safe_result(emotion: str = "Neutral", confidence: float = 0.0, error: str = "") -> Dict[str, Any]:
@@ -98,6 +109,7 @@ def initialize_face_runtime(
         "output_details": interpreter.get_output_details(),
         "face_cascade": face_cascade,
         "labels": DEFAULT_EMOTIONS,
+        "invoke_lock": threading.Lock(),
     }
     LOGGER.info("FER model preloaded from %s using %s", model_path, TFLITE_BACKEND)
     return runtime
@@ -105,8 +117,12 @@ def initialize_face_runtime(
 
 def get_face_runtime() -> Dict[str, Any]:
     global _DEFAULT_RUNTIME
-    if _DEFAULT_RUNTIME is None:
-        _DEFAULT_RUNTIME = initialize_face_runtime()
+    if _DEFAULT_RUNTIME is not None:
+        return _DEFAULT_RUNTIME
+
+    with _RUNTIME_LOCK:
+        if _DEFAULT_RUNTIME is None:
+            _DEFAULT_RUNTIME = initialize_face_runtime()
     return _DEFAULT_RUNTIME
 
 
@@ -118,13 +134,19 @@ def analyze_face(image_data: str, runtime: Optional[Dict[str, Any]] = None) -> D
     output_details = active_runtime["output_details"]
     face_cascade = active_runtime["face_cascade"]
     labels = active_runtime["labels"]
+    invoke_lock = active_runtime["invoke_lock"]
 
     try:
         if "," in image_data:
             image_data = image_data.split(",", 1)[1]
 
-        np_img = np.frombuffer(base64.b64decode(image_data), np.uint8)
-        frame = cv2.imdecode(np_img, cv2.IMREAD_COLOR)
+        try:
+            image_bytes = base64.b64decode(image_data, validate=True)
+        except Exception:
+            return _safe_result(error="Invalid base64 image payload")
+
+        np_img = np.frombuffer(image_bytes, np.uint8)
+        frame = cv2.imdecode(np_img, cv2.IMREAD_GRAYSCALE)
         if frame is None:
             return _safe_result(error="Invalid frame data")
 
@@ -140,24 +162,26 @@ def analyze_face(image_data: str, runtime: Optional[Dict[str, Any]] = None) -> D
                     interpolation=cv2.INTER_AREA,
                 )
 
-        gray = cv2.cvtColor(detection_frame, cv2.COLOR_BGR2GRAY)
         faces = face_cascade.detectMultiScale(
-            gray,
+            detection_frame,
             FER_FACE_SCALE_FACTOR,
             FER_FACE_MIN_NEIGHBORS,
+            minSize=(FER_FACE_MIN_SIZE, FER_FACE_MIN_SIZE),
         )
         if len(faces) == 0:
             return _safe_result(emotion="No Face", confidence=0.0)
 
-        (x, y, w, h) = faces[0]
-        roi_gray = gray[y:y + h, x:x + w]
+        # Track the most prominent face to avoid unstable emotion jumps with multi-face frames.
+        (x, y, w, h) = max(faces, key=lambda item: int(item[2]) * int(item[3]))
+        roi_gray = detection_frame[y:y + h, x:x + w]
         roi = cv2.resize(roi_gray, (48, 48))
         roi = roi.astype("float32") / 255.0
         roi = np.expand_dims(np.expand_dims(roi, axis=0), axis=-1)
 
-        interpreter.set_tensor(input_details[0]["index"], roi)
-        interpreter.invoke()
-        output_data = interpreter.get_tensor(output_details[0]["index"])
+        with invoke_lock:
+            interpreter.set_tensor(input_details[0]["index"], roi)
+            interpreter.invoke()
+            output_data = interpreter.get_tensor(output_details[0]["index"])
 
         prediction_index = int(np.argmax(output_data))
         confidence = float(np.max(output_data))
@@ -178,9 +202,11 @@ def analyze_face(image_data: str, runtime: Optional[Dict[str, Any]] = None) -> D
             del roi_gray
         if "faces" in locals():
             del faces
-        if "gray" in locals():
-            del gray
         if "frame" in locals():
             del frame
+        if "detection_frame" in locals():
+            del detection_frame
         if "np_img" in locals():
             del np_img
+        if "image_bytes" in locals():
+            del image_bytes

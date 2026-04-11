@@ -196,6 +196,10 @@ CLOUD_LLM_LAZY_INIT = _env_bool("SERENITY_CLOUD_LLM_LAZY_INIT", EDGE_OPTIMIZED_M
 CLOUD_LLM_WARMUP_ENABLED = _env_bool("SERENITY_CLOUD_LLM_WARMUP_ENABLED", not EDGE_OPTIMIZED_MODE)
 CLOUD_LLM_WARMUP_TEXT = os.getenv("SERENITY_CLOUD_LLM_WARMUP_TEXT", "Hello").strip() or "Hello"
 CLOUD_LLM_WARMUP_TIMEOUT_SECONDS = int(os.getenv("SERENITY_CLOUD_LLM_WARMUP_TIMEOUT_SECONDS", "45"))
+ADMIN_DEFAULT_LIMIT = max(20, int(os.getenv("SERENITY_ADMIN_DEFAULT_LIMIT", "300")))
+ADMIN_MAX_LIMIT = max(100, int(os.getenv("SERENITY_ADMIN_MAX_LIMIT", "5000")))
+ADMIN_CHAT_TEXT_LIMIT = max(64, int(os.getenv("SERENITY_ADMIN_CHAT_TEXT_LIMIT", "420")))
+ADMIN_SESSION_TEXT_LIMIT = max(64, int(os.getenv("SERENITY_ADMIN_SESSION_TEXT_LIMIT", "420")))
 
 _stream_queue_wait_default = "0.015" if EDGE_OPTIMIZED_MODE else "0.01"
 try:
@@ -655,7 +659,7 @@ async def questionnaire_history(username: str, limit: int = 30) -> Dict[str, obj
 
 
 @app.get("/api/admin/overview")
-async def admin_overview(limit: Optional[int] = None) -> Dict[str, object]:
+async def admin_overview(limit: Optional[int] = None, include_answers: bool = False) -> Dict[str, object]:
 
     db = SessionLocal()
     try:
@@ -665,18 +669,34 @@ async def admin_overview(limit: Optional[int] = None) -> Dict[str, object]:
         total_emotion_events = int(db.query(func.count(models.Emotion.id)).scalar() or 0)
         total_questionnaire_entries = int(db.query(func.count(models.QuestionnaireResult.id)).scalar() or 0)
 
-        if limit is None or int(limit) <= 0:
-            safe_limit = max(1, total_conversation_turns)
-            session_limit = max(1, total_sessions)
-            questionnaire_limit = max(1, total_questionnaire_entries)
+        if limit is None:
+            safe_limit = min(ADMIN_DEFAULT_LIMIT, ADMIN_MAX_LIMIT)
+            session_limit = min(ADMIN_DEFAULT_LIMIT, ADMIN_MAX_LIMIT)
+            questionnaire_limit = min(max(100, ADMIN_DEFAULT_LIMIT * 3), ADMIN_MAX_LIMIT * 3)
+        elif int(limit) <= 0:
+            safe_limit = min(max(1, total_conversation_turns), ADMIN_MAX_LIMIT)
+            session_limit = min(max(1, total_sessions), ADMIN_MAX_LIMIT)
+            questionnaire_limit = min(max(1, total_questionnaire_entries), ADMIN_MAX_LIMIT * 3)
         else:
-            safe_limit = max(20, min(5000, int(limit)))
-            session_limit = max(20, min(5000, safe_limit))
-            questionnaire_limit = max(100, min(10000, safe_limit * 3))
+            safe_limit = max(20, min(ADMIN_MAX_LIMIT, int(limit)))
+            session_limit = max(20, min(ADMIN_MAX_LIMIT, safe_limit))
+            questionnaire_limit = max(100, min(ADMIN_MAX_LIMIT * 3, safe_limit * 3))
 
-        conversation_turns = fetch_recent_turn_summaries(db, limit=safe_limit)
-        sessions = fetch_recent_sessions_with_emotions(db, limit=session_limit)
-        questionnaire_results = fetch_questionnaire_results(db, limit=questionnaire_limit)
+        conversation_turns = fetch_recent_turn_summaries(
+            db,
+            limit=safe_limit,
+            text_limit=ADMIN_CHAT_TEXT_LIMIT,
+        )
+        sessions = fetch_recent_sessions_with_emotions(
+            db,
+            limit=session_limit,
+            conversation_limit=ADMIN_SESSION_TEXT_LIMIT,
+        )
+        questionnaire_results = fetch_questionnaire_results(
+            db,
+            limit=questionnaire_limit,
+            include_answers=include_answers,
+        )
     except Exception as exc:
         LOGGER.exception("Failed to build admin overview: %s", exc)
         raise HTTPException(status_code=500, detail="Failed to build admin overview") from exc

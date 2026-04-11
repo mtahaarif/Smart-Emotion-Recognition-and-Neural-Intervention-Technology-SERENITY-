@@ -148,16 +148,22 @@ def persist_questionnaire_result(
 	return result
 
 
-def questionnaire_result_to_dict(result, username: Optional[str] = None) -> Dict[str, Any]:
-	return {
+def questionnaire_result_to_dict(
+	result,
+	username: Optional[str] = None,
+	include_answers: bool = True,
+) -> Dict[str, Any]:
+	payload: Dict[str, Any] = {
 		"id": result.id,
 		"username": username,
 		"questionnaire_type": result.questionnaire_type,
-		"answers": _decode_answers_json(result.answers_json),
 		"total_score": int(result.total_score or 0),
 		"severity": result.severity or "unknown",
 		"created_at": result.created_at.isoformat() if result.created_at else None,
 	}
+	if include_answers:
+		payload["answers"] = _decode_answers_json(result.answers_json)
+	return payload
 
 
 def fetch_questionnaire_results(
@@ -165,6 +171,7 @@ def fetch_questionnaire_results(
 	username: Optional[str] = None,
 	questionnaire_type: Optional[str] = None,
 	limit: int = 100,
+	include_answers: bool = True,
 ) -> List[Dict[str, Any]]:
 	try:
 		from . import models
@@ -187,10 +194,17 @@ def fetch_questionnaire_results(
 		.all()
 	)
 
-	return [questionnaire_result_to_dict(result, row_username) for result, row_username in rows]
+	return [
+		questionnaire_result_to_dict(result, row_username, include_answers=include_answers)
+		for result, row_username in rows
+	]
 
 
-def fetch_recent_turn_summaries(db, limit: int = 200) -> List[Dict[str, Any]]:
+def fetch_recent_turn_summaries(
+	db,
+	limit: int = 200,
+	text_limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
 	try:
 		from . import models
 	except ImportError:
@@ -205,13 +219,20 @@ def fetch_recent_turn_summaries(db, limit: int = 200) -> List[Dict[str, Any]]:
 	)
 
 	output: List[Dict[str, Any]] = []
+	char_limit = max(64, int(text_limit)) if text_limit is not None else None
 	for turn, username in rows:
+		user_text = turn.user_text
+		assistant_text = turn.assistant_text
+		if char_limit is not None:
+			user_text = _clamp_text(user_text, max_chars=char_limit)
+			assistant_text = _clamp_text(assistant_text, max_chars=char_limit)
+
 		output.append(
 			{
 				"id": turn.id,
 				"username": username,
-				"user_text": turn.user_text,
-				"assistant_text": turn.assistant_text,
+				"user_text": user_text,
+				"assistant_text": assistant_text,
 				"dominant_emotion": turn.dominant_emotion,
 				"speech_emotion": turn.speech_emotion,
 				"face_emotion": turn.face_emotion,
@@ -222,7 +243,11 @@ def fetch_recent_turn_summaries(db, limit: int = 200) -> List[Dict[str, Any]]:
 	return output
 
 
-def fetch_recent_sessions_with_emotions(db, limit: int = 100) -> List[Dict[str, Any]]:
+def fetch_recent_sessions_with_emotions(
+	db,
+	limit: int = 100,
+	conversation_limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
 	try:
 		from . import models
 	except ImportError:
@@ -237,6 +262,7 @@ def fetch_recent_sessions_with_emotions(db, limit: int = 100) -> List[Dict[str, 
 	)
 
 	items: List[Dict[str, Any]] = []
+	conv_char_limit = max(64, int(conversation_limit)) if conversation_limit is not None else None
 	for session in sessions:
 		emotions = []
 		for emotion in sorted(session.emotions, key=lambda value: value.timestamp or datetime.min):
@@ -249,12 +275,16 @@ def fetch_recent_sessions_with_emotions(db, limit: int = 100) -> List[Dict[str, 
 				}
 			)
 
+		conversation_text = session.conversation
+		if conv_char_limit is not None:
+			conversation_text = _clamp_text(conversation_text, max_chars=conv_char_limit)
+
 		items.append(
 			{
 				"id": session.id,
 				"username": session.user.username if session.user else None,
 				"timestamp": session.timestamp.isoformat() if session.timestamp else None,
-				"conversation": session.conversation,
+				"conversation": conversation_text,
 				"emotions": emotions,
 			}
 		)

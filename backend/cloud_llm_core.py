@@ -82,13 +82,17 @@ class CloudLLMClient:
         self._consecutive_failures = 0
         self._unavailable_until_epoch = 0.0
 
+        pool_connections = max(1, int(os.getenv("SERENITY_CLOUD_LLM_POOL_CONNECTIONS", "4")))
+        pool_maxsize = max(1, int(os.getenv("SERENITY_CLOUD_LLM_POOL_MAXSIZE", "8")))
+        pool_block = os.getenv("SERENITY_CLOUD_LLM_POOL_BLOCK", "false").strip().lower() == "true"
+
         # Reuse TCP connections across requests to reduce handshake overhead.
         self.session = requests.Session()
         adapter = requests.adapters.HTTPAdapter(
-            pool_connections=8,
-            pool_maxsize=16,
+            pool_connections=pool_connections,
+            pool_maxsize=pool_maxsize,
             max_retries=0,
-            pool_block=False,
+            pool_block=pool_block,
         )
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
@@ -97,6 +101,8 @@ class CloudLLMClient:
         self._camel_boundary_re = re.compile(r"([a-z])([A-Z])")
         self._whitespace_re = re.compile(r"\s+")
         self._glued_alpha_run_re = re.compile(r"[A-Za-z]{12,}")
+        self._horizontal_space_re = re.compile(r"[ \t]+")
+        self._space_before_punct_re = re.compile(r"\s+([,.;:!?])")
         self._junk_patterns = [
             re.compile(r"\*(?:Reflects\s*feelings|Reflectsfeelings)\*", flags=re.IGNORECASE),
             re.compile(r"\*(?:Asks\s*follow-?up\s*question|Asksfollow-?upquestion)\*", flags=re.IGNORECASE),
@@ -158,22 +164,21 @@ class CloudLLMClient:
 
         return source[:star_index], True
 
-    @staticmethod
-    def _strip_starred_segments(text: str, preserve_edges: bool = False) -> str:
+    def _strip_starred_segments(self, text: str, preserve_edges: bool = False) -> str:
         source = str(text or "")
         if not source:
             return ""
 
         star_index = source.find("*")
         cleaned = source if star_index == -1 else source[:star_index]
-        cleaned = re.sub(r"[ \t]+", " ", cleaned)
-        cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+        cleaned = self._horizontal_space_re.sub(" ", cleaned)
+        cleaned = self._space_before_punct_re.sub(r"\1", cleaned)
         return cleaned if preserve_edges else cleaned.strip()
 
     def _normalize_chunk(self, text: str, preserve_edges: bool = False) -> str:
         if self.trust_polished_response:
             normalized = self._strip_starred_segments(str(text or ""), preserve_edges=True).replace("\r", "")
-            normalized = re.sub(r"[ \t]+", " ", normalized)
+            normalized = self._horizontal_space_re.sub(" ", normalized)
             return normalized if preserve_edges else normalized.strip()
 
         return self.hard_clean(text, preserve_edges=preserve_edges)

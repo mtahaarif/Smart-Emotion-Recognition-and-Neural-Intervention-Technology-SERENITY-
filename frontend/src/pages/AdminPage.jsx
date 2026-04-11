@@ -40,7 +40,10 @@ const AdminPage = ({ user, onLogout }) => {
   const [overview, setOverview] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState('');
-  const [limit, setLimit] = useState(0);
+  const [limit, setLimit] = useState(300);
+  const [chatVisibleCount, setChatVisibleCount] = useState(80);
+  const [sessionVisibleCount, setSessionVisibleCount] = useState(40);
+  const [questionnaireVisibleCount, setQuestionnaireVisibleCount] = useState(80);
 
   const metrics = useMemo(() => (Array.isArray(overview?.metrics) ? overview.metrics : []), [overview]);
   const chats = useMemo(() => (Array.isArray(overview?.chats) ? overview.chats : []), [overview]);
@@ -51,10 +54,19 @@ const AdminPage = ({ user, onLogout }) => {
   );
   const topEmotions = useMemo(() => (Array.isArray(overview?.top_emotions) ? overview.top_emotions : []), [overview]);
   const flaggedUsers = useMemo(() => (Array.isArray(overview?.flagged_users) ? overview.flagged_users : []), [overview]);
+  const displayedChats = useMemo(() => chats.slice(0, chatVisibleCount), [chats, chatVisibleCount]);
+  const displayedSessions = useMemo(() => sessions.slice(0, sessionVisibleCount), [sessions, sessionVisibleCount]);
+  const displayedQuestionnaires = useMemo(
+    () => questionnaireResults.slice(0, questionnaireVisibleCount),
+    [questionnaireResults, questionnaireVisibleCount]
+  );
 
   const loadOverview = async (targetLimit = limit) => {
     setErrorMessage('');
     setIsLoading(true);
+    setChatVisibleCount(80);
+    setSessionVisibleCount(40);
+    setQuestionnaireVisibleCount(80);
     try {
       const response = await axios.get(`${API_BASE_URL}/api/admin/overview`, {
         params: { limit: targetLimit },
@@ -110,7 +122,7 @@ const AdminPage = ({ user, onLogout }) => {
                   value={limit}
                   min={0}
                   max={5000}
-                  onChange={(event) => setLimit(Number(event.target.value || 0))}
+                  onChange={(event) => setLimit(Number(event.target.value || 300))}
                   className="w-28 rounded-lg bg-slate-950 border border-cyan-900/60 px-3 py-2 text-sm text-slate-200"
                 />
                 <button
@@ -122,7 +134,7 @@ const AdminPage = ({ user, onLogout }) => {
                 </button>
               </div>
             </div>
-            <p className="text-xs text-slate-500 mt-2">Set limit to 0 to fetch all local rows.</p>
+            <p className="text-xs text-slate-500 mt-2">Default limit is 300 for fast rendering. Set limit to 0 only when you need the full dataset.</p>
 
             {isLoading ? (
               <div className="mt-4 rounded-lg border border-cyan-800/60 bg-slate-900 p-3 text-slate-300 inline-flex items-center gap-2">
@@ -147,7 +159,7 @@ const AdminPage = ({ user, onLogout }) => {
               <h3 className="text-xs uppercase tracking-wider text-cyan-300 mb-3">Chats and Conversations</h3>
               <div className="space-y-3 max-h-[420px] overflow-auto pr-1">
                 {chats.length === 0 && <p className="text-slate-500 text-sm">No conversation turns available.</p>}
-                {chats.map((chat) => (
+                {displayedChats.map((chat) => (
                   <div key={chat.id} className="rounded-lg border border-cyan-900/40 bg-slate-950/70 p-3 space-y-1">
                     <p className="text-xs text-slate-400">
                       {chat.username || 'unknown'} • {formatDate(chat.timestamp)} • emotion: {String(chat.dominant_emotion || 'neutral').toLowerCase()}
@@ -156,6 +168,15 @@ const AdminPage = ({ user, onLogout }) => {
                     <p className="text-sm text-white">Serenity: {chat.assistant_text}</p>
                   </div>
                 ))}
+                {displayedChats.length < chats.length && (
+                  <button
+                    type="button"
+                    onClick={() => setChatVisibleCount((prev) => prev + 80)}
+                    className="w-full rounded-lg border border-cyan-800/60 bg-slate-900 px-3 py-2 text-sm text-cyan-300 hover:border-cyan-600"
+                  >
+                    Load 80 More Chats ({displayedChats.length}/{chats.length})
+                  </button>
+                )}
               </div>
             </div>
 
@@ -178,7 +199,7 @@ const AdminPage = ({ user, onLogout }) => {
               <h3 className="text-xs uppercase tracking-wider text-cyan-300 mb-3">Sessions and Emotion Trails</h3>
               <div className="space-y-3 max-h-[360px] overflow-auto pr-1">
                 {sessions.length === 0 && <p className="text-slate-500 text-sm">No legacy sessions available.</p>}
-                {sessions.map((session) => (
+                {displayedSessions.map((session) => (
                   <div key={session.id} className="rounded-lg border border-cyan-900/40 bg-slate-950/70 p-3">
                     <p className="text-xs text-slate-400">
                       Session #{session.id} • {session.username || 'unknown'} • {formatDate(session.timestamp)}
@@ -196,6 +217,15 @@ const AdminPage = ({ user, onLogout }) => {
                     </div>
                   </div>
                 ))}
+                {displayedSessions.length < sessions.length && (
+                  <button
+                    type="button"
+                    onClick={() => setSessionVisibleCount((prev) => prev + 40)}
+                    className="w-full rounded-lg border border-cyan-800/60 bg-slate-900 px-3 py-2 text-sm text-cyan-300 hover:border-cyan-600"
+                  >
+                    Load 40 More Sessions ({displayedSessions.length}/{sessions.length})
+                  </button>
+                )}
               </div>
             </div>
 
@@ -203,7 +233,7 @@ const AdminPage = ({ user, onLogout }) => {
               <h3 className="text-xs uppercase tracking-wider text-cyan-300 mb-3">Questionnaires and Risk Signals</h3>
               <div className="space-y-3 max-h-[360px] overflow-auto pr-1">
                 {questionnaireResults.length === 0 && <p className="text-slate-500 text-sm">No questionnaire entries found.</p>}
-                {questionnaireResults.map((row) => (
+                {displayedQuestionnaires.map((row) => (
                   <div key={row.id} className="rounded-lg border border-cyan-900/40 bg-slate-950/70 p-3">
                     <p className="text-xs text-slate-400">
                       {row.username || 'unknown'} • {row.questionnaire_type} • {formatDate(row.created_at)}
@@ -212,6 +242,15 @@ const AdminPage = ({ user, onLogout }) => {
                     <p className="text-sm text-emerald-300">Severity: {row.severity}</p>
                   </div>
                 ))}
+                {displayedQuestionnaires.length < questionnaireResults.length && (
+                  <button
+                    type="button"
+                    onClick={() => setQuestionnaireVisibleCount((prev) => prev + 80)}
+                    className="w-full rounded-lg border border-cyan-800/60 bg-slate-900 px-3 py-2 text-sm text-cyan-300 hover:border-cyan-600"
+                  >
+                    Load 80 More Results ({displayedQuestionnaires.length}/{questionnaireResults.length})
+                  </button>
+                )}
               </div>
 
               {flaggedUsers.length > 0 && (

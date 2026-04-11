@@ -1,5 +1,6 @@
 import logging
 import os
+import threading
 from typing import Any, Dict, Optional
 
 import librosa
@@ -25,6 +26,7 @@ SER_AUDIO_RESAMPLE_TYPE = os.getenv("SERENITY_SER_AUDIO_RESAMPLE_TYPE", "polypha
 LOGGER = logging.getLogger(__name__)
 
 _DEFAULT_RUNTIME: Optional[Dict[str, Any]] = None
+_RUNTIME_LOCK = threading.Lock()
 
 
 def _safe_result(emotion: str = "Neutral", confidence: float = 0.0, error: str = "") -> Dict[str, Any]:
@@ -93,6 +95,7 @@ def initialize_audio_runtime(
         "input_details": interpreter.get_input_details(),
         "output_details": interpreter.get_output_details(),
         "labels": DEFAULT_EMOTIONS,
+        "invoke_lock": threading.Lock(),
     }
     LOGGER.info("SER model preloaded from %s using %s", model_path, TFLITE_BACKEND)
     return runtime
@@ -100,8 +103,12 @@ def initialize_audio_runtime(
 
 def get_audio_runtime() -> Dict[str, Any]:
     global _DEFAULT_RUNTIME
-    if _DEFAULT_RUNTIME is None:
-        _DEFAULT_RUNTIME = initialize_audio_runtime()
+    if _DEFAULT_RUNTIME is not None:
+        return _DEFAULT_RUNTIME
+
+    with _RUNTIME_LOCK:
+        if _DEFAULT_RUNTIME is None:
+            _DEFAULT_RUNTIME = initialize_audio_runtime()
     return _DEFAULT_RUNTIME
 
 
@@ -147,6 +154,7 @@ def predict_audio_emotion(file_path: str, runtime: Optional[Dict[str, Any]] = No
     input_details = active_runtime["input_details"]
     output_details = active_runtime["output_details"]
     labels = active_runtime["labels"]
+    invoke_lock = active_runtime["invoke_lock"]
 
     try:
         try:
@@ -179,9 +187,10 @@ def predict_audio_emotion(file_path: str, runtime: Optional[Dict[str, Any]] = No
             return _safe_result(error="Audio input was empty after decoding")
         features = _prepare_features(y=y, sr=sr, model_shape=input_details[0]["shape"])
 
-        interpreter.set_tensor(input_details[0]["index"], features)
-        interpreter.invoke()
-        output_data = interpreter.get_tensor(output_details[0]["index"])
+        with invoke_lock:
+            interpreter.set_tensor(input_details[0]["index"], features)
+            interpreter.invoke()
+            output_data = interpreter.get_tensor(output_details[0]["index"])
 
         prediction_index = int(np.argmax(output_data))
         confidence = float(np.max(output_data))
