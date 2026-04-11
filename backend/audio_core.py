@@ -1,6 +1,7 @@
 import logging
 import os
 import threading
+import warnings
 from typing import Any, Dict, Optional
 
 import librosa
@@ -41,6 +42,13 @@ def _build_interpreter(model_path: str, num_threads: int) -> tuple[tflite.Interp
     delegate_name = os.getenv("SERENITY_TFLITE_XNNPACK_DELEGATE", "libtensorflowlite_xnnpack_delegate.so")
     require_xnnpack = os.getenv("SERENITY_REQUIRE_XNNPACK", "false").strip().lower() == "true"
 
+    # On Windows, rely on built-in CPU delegate path unless an explicit delegate library is provided.
+    if os.name == "nt" and not (os.path.isabs(delegate_name) or os.path.exists(delegate_name)):
+        interpreter = tflite.Interpreter(model_path=model_path, num_threads=num_threads)
+        interpreter.allocate_tensors()
+        LOGGER.info("SER using default TFLite CPU delegates on Windows.")
+        return interpreter, None
+
     delegate_loader = getattr(tflite, "load_delegate", None)
     if delegate_loader is None:
         experimental = getattr(tflite, "experimental", None)
@@ -48,10 +56,6 @@ def _build_interpreter(model_path: str, num_threads: int) -> tuple[tflite.Interp
 
     delegate = None
     try:
-        # On Windows dev boxes, default .so delegate probing is invalid; only try explicit delegate paths there.
-        if os.name == "nt" and not (os.path.isabs(delegate_name) or os.path.exists(delegate_name)):
-            raise RuntimeError("Skipping explicit XNNPACK delegate load on Windows without explicit delegate path")
-
         if delegate_loader is None:
             raise RuntimeError("No TFLite delegate loader is available in this TensorFlow build")
 
@@ -158,14 +162,21 @@ def predict_audio_emotion(file_path: str, runtime: Optional[Dict[str, Any]] = No
 
     try:
         try:
-            y, sr = librosa.load(
-                file_path,
-                sr=SER_AUDIO_SAMPLE_RATE,
-                mono=True,
-                duration=SER_AUDIO_DURATION_SECONDS,
-                offset=SER_AUDIO_OFFSET_SECONDS,
-                res_type=SER_AUDIO_RESAMPLE_TYPE,
-            )
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=r"PySoundFile failed.*", category=UserWarning)
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"librosa\.core\.audio\.__audioread_load.*",
+                    category=FutureWarning,
+                )
+                y, sr = librosa.load(
+                    file_path,
+                    sr=SER_AUDIO_SAMPLE_RATE,
+                    mono=True,
+                    duration=SER_AUDIO_DURATION_SECONDS,
+                    offset=SER_AUDIO_OFFSET_SECONDS,
+                    res_type=SER_AUDIO_RESAMPLE_TYPE,
+                )
         except ModuleNotFoundError as exc:
             if exc.name != "resampy":
                 raise
@@ -174,14 +185,21 @@ def predict_audio_emotion(file_path: str, runtime: Optional[Dict[str, Any]] = No
                 "SER resampler '%s' requires resampy, retrying with scipy polyphase.",
                 SER_AUDIO_RESAMPLE_TYPE,
             )
-            y, sr = librosa.load(
-                file_path,
-                sr=SER_AUDIO_SAMPLE_RATE,
-                mono=True,
-                duration=SER_AUDIO_DURATION_SECONDS,
-                offset=SER_AUDIO_OFFSET_SECONDS,
-                res_type="polyphase",
-            )
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", message=r"PySoundFile failed.*", category=UserWarning)
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"librosa\.core\.audio\.__audioread_load.*",
+                    category=FutureWarning,
+                )
+                y, sr = librosa.load(
+                    file_path,
+                    sr=SER_AUDIO_SAMPLE_RATE,
+                    mono=True,
+                    duration=SER_AUDIO_DURATION_SECONDS,
+                    offset=SER_AUDIO_OFFSET_SECONDS,
+                    res_type="polyphase",
+                )
 
         if y.size == 0:
             return _safe_result(error="Audio input was empty after decoding")

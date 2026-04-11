@@ -50,6 +50,13 @@ def _build_interpreter(model_path: str, num_threads: int) -> tuple[tflite.Interp
     delegate_name = os.getenv("SERENITY_TFLITE_XNNPACK_DELEGATE", "libtensorflowlite_xnnpack_delegate.so")
     require_xnnpack = os.getenv("SERENITY_REQUIRE_XNNPACK", "false").strip().lower() == "true"
 
+    # On Windows, rely on built-in CPU delegate path unless an explicit delegate library is provided.
+    if os.name == "nt" and not (os.path.isabs(delegate_name) or os.path.exists(delegate_name)):
+        interpreter = tflite.Interpreter(model_path=model_path, num_threads=num_threads)
+        interpreter.allocate_tensors()
+        LOGGER.info("FER using default TFLite CPU delegates on Windows.")
+        return interpreter, None
+
     delegate_loader = getattr(tflite, "load_delegate", None)
     if delegate_loader is None:
         experimental = getattr(tflite, "experimental", None)
@@ -57,10 +64,6 @@ def _build_interpreter(model_path: str, num_threads: int) -> tuple[tflite.Interp
 
     delegate = None
     try:
-        # On Windows dev boxes, default .so delegate probing is invalid; only try explicit delegate paths there.
-        if os.name == "nt" and not (os.path.isabs(delegate_name) or os.path.exists(delegate_name)):
-            raise RuntimeError("Skipping explicit XNNPACK delegate load on Windows without explicit delegate path")
-
         if delegate_loader is None:
             raise RuntimeError("No TFLite delegate loader is available in this TensorFlow build")
 

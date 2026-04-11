@@ -13,6 +13,9 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+# Reduce TensorFlow startup noise on edge deployments while keeping warnings/errors.
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")
+
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
@@ -192,6 +195,7 @@ STREAM_TOKEN_DELTA = _env_bool("SERENITY_STREAM_TOKEN_DELTA", True)
 STREAM_TTS_SENTENCE_AUDIO = _env_bool("SERENITY_STREAM_TTS_SENTENCE_AUDIO", True)
 STREAM_TTS_FINAL_TEXT_ONLY = _env_bool("SERENITY_STREAM_TTS_FINAL_TEXT_ONLY", False)
 TRUST_CLOUD_POLISHED_RESPONSE = _env_bool("SERENITY_TRUST_CLOUD_POLISHED_RESPONSE", True)
+CLOUD_LLM_ENABLED = _env_bool("SERENITY_CLOUD_LLM_ENABLED", True)
 CLOUD_LLM_LAZY_INIT = _env_bool("SERENITY_CLOUD_LLM_LAZY_INIT", EDGE_OPTIMIZED_MODE)
 CLOUD_LLM_WARMUP_ENABLED = _env_bool("SERENITY_CLOUD_LLM_WARMUP_ENABLED", not EDGE_OPTIMIZED_MODE)
 CLOUD_LLM_WARMUP_TEXT = os.getenv("SERENITY_CLOUD_LLM_WARMUP_TEXT", "Hello").strip() or "Hello"
@@ -226,6 +230,12 @@ def _state_set(key: str, value) -> None:
 
 
 def _ensure_cloud_llm_client_sync() -> Tuple[Optional[CloudLLMClient], Optional[str], bool]:
+    if not CLOUD_LLM_ENABLED:
+        message = "Cloud LLM disabled by configuration"
+        _state_set("cloud_llm_client", None)
+        _state_set("rag_init_error", message)
+        return None, message, False
+
     cloud_llm_client = _state_get("cloud_llm_client")
     if cloud_llm_client is not None:
         return cloud_llm_client, None, False
@@ -403,7 +413,7 @@ def _ensure_whisper_runtime_sync() -> Optional[str]:
                 _state_set("whisper_backend", "openai-whisper")
                 _state_set("whisper_model", loaded_model)
                 _state_set("whisper_init_error", None)
-                LOGGER.warning(
+                LOGGER.info(
                     "faster-whisper not installed; loaded openai-whisper '%s' on %s",
                     WHISPER_MODEL_SIZE,
                     whisper_device.upper(),
@@ -460,7 +470,10 @@ async def serenity_lifespan(fastapi_app: FastAPI):
     else:
         LOGGER.info("Whisper preload disabled: STT model will load on first transcription request.")
 
-    if CLOUD_LLM_LAZY_INIT:
+    if not CLOUD_LLM_ENABLED:
+        fastapi_app.state.rag_init_error = "Cloud LLM disabled by configuration"
+        LOGGER.info("Cloud LLM is disabled via SERENITY_CLOUD_LLM_ENABLED.")
+    elif CLOUD_LLM_LAZY_INIT:
         LOGGER.info("Cloud LLM lazy init enabled: client will initialize on first chat request.")
     else:
         try:
@@ -470,7 +483,7 @@ async def serenity_lifespan(fastapi_app: FastAPI):
             fastapi_app.state.rag_init_error = str(exc)
             LOGGER.warning("Cloud LLM client initialization failed: %s", exc)
 
-    if CLOUD_LLM_WARMUP_ENABLED and fastapi_app.state.cloud_llm_client is not None:
+    if CLOUD_LLM_ENABLED and CLOUD_LLM_WARMUP_ENABLED and fastapi_app.state.cloud_llm_client is not None:
         fastapi_app.state.cloud_llm_warmup_task = asyncio.create_task(_warmup_cloud_llm_once())
 
     if TTS_WARMUP_ENABLED and TTS_ENABLED and edge_tts is not None:
