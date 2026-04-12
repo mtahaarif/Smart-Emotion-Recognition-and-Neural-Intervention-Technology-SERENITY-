@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sys
 import threading
 import tempfile
@@ -155,6 +156,20 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
 def _state_get(k: str, d=None): return getattr(app.state, k, d)
 def _state_set(k: str, v): setattr(app.state, k, v)
 def _dedupe_errors(errors: List[str]) -> List[str]: return list(dict.fromkeys([str(e) for e in errors if str(e).strip()]))
+def _is_bcrypt_hash(value: str) -> bool:
+    return bool(value and (value.startswith("$2a$") or value.startswith("$2b$") or value.startswith("$2y$")))
+def _hash_password(password: str) -> str:
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+def _verify_password(plain_password: str, stored_password: str) -> bool:
+    stored = str(stored_password or "")
+    if not stored:
+        return False
+    if _is_bcrypt_hash(stored):
+        with contextlib.suppress(ValueError):
+            return bcrypt.checkpw(plain_password.encode("utf-8"), stored.encode("utf-8"))
+        return False
+    # Legacy plain-text fallback for old records; upgraded to bcrypt on successful login.
+    return secrets.compare_digest(stored, plain_password)
 def _normalize_emotion_label(e: str) -> str: return EMOTION_ALIAS.get(str(e or "neutral").strip().lower(), str(e or "neutral").strip().lower())
 def _risk_label(s: int) -> str: return "elevated" if s >= 6 else "monitor" if s >= 3 else "stable"
 def _engagement_band(s: int) -> str: return "high" if s >= 70 else "moderate" if s >= 35 else "low"
@@ -574,15 +589,47 @@ async def _stream_chat_events(db: Session, username: str, user_text: str, domina
 # --- Endpoints ---
 @app.post("/register", response_model=AuthResponse)
 async def register(payload: AuthRequest, db: Session = Depends(get_db)):
-    if await run_in_threadpool(lambda: db.query(models.User).filter(models.User.username == payload.username).first()): raise HTTPException(400, "Exists")
-    new_user = models.User(username=payload.username, password=bcrypt.hashpw(payload.password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8'))
+    username = str(payload.username or "").strip()
+    password = str(payload.password or "")
+    if not username or not password:
+        raise HTTPException(400, "Username and password required")
+
+    hashed_password = _hash_password(password)
+
+    existing = await run_in_threadpool(lambda: db.query(models.User).filter(models.User.username == username).first())
+    if existing:
+        # Allow claiming legacy placeholder accounts created before registration.
+        if not _is_bcrypt_hash(str(existing.password or "")):
+            def _claim_existing_user() -> None:
+                existing.password = hashed_password
+                db.commit()
+            await run_in_threadpool(_claim_existing_user)
+            return AuthResponse(message="Success", username=existing.username)
+        raise HTTPException(400, "Exists")
+
+    new_user = models.User(username=username, password=hashed_password)
     await run_in_threadpool(lambda: (db.add(new_user), db.commit()))
     return AuthResponse(message="Success", username=new_user.username)
 
 @app.post("/login", response_model=AuthResponse)
 async def login(payload: AuthRequest, db: Session = Depends(get_db)):
-    user = await run_in_threadpool(lambda: db.query(models.User).filter(models.User.username == payload.username).first())
-    if not user or not bcrypt.checkpw(payload.password.encode('utf-8'), user.password.encode('utf-8')): raise HTTPException(401, "Invalid")
+    username = str(payload.username or "").strip()
+    password = str(payload.password or "")
+    if not username or not password:
+        raise HTTPException(400, "Username and password required")
+
+    user = await run_in_threadpool(lambda: db.query(models.User).filter(models.User.username == username).first())
+
+    if not user or not _verify_password(password, str(user.password or "")):
+        raise HTTPException(401, "Invalid")
+
+    # Seamless one-time migration of legacy plain-text records to bcrypt.
+    if not _is_bcrypt_hash(str(user.password or "")):
+        def _upgrade_legacy_password() -> None:
+            user.password = _hash_password(password)
+            db.commit()
+        await run_in_threadpool(_upgrade_legacy_password)
+
     return AuthResponse(message="Success", username=user.username)
 
 @app.get("/api/questionnaires/templates")
