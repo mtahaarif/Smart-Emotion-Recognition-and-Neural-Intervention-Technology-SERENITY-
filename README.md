@@ -1,614 +1,555 @@
 # SERENITY
 
-Smart Emotion Recognition and Neural Intervention Technology (SERENITY) is a multimodal mental-health support platform that combines:
+Smart Emotion Recognition and Neural Intervention Technology (SERENITY) is a multimodal mental-health support platform that combines speech understanding, emotion sensing, clinical screening, and cloud-assisted therapeutic dialogue.
 
-- speech transcription,
-- speech emotion recognition (SER),
-- optional face emotion recognition (FER),
-- cloud-assisted conversational response generation,
-- standardized questionnaire workflows (PHQ-9, GAD-7, PCL-5),
-- clinician-style analytics in a user-scoped admin observatory.
-
-The project is designed for practical operation on constrained systems (including Raspberry Pi class devices) with explicit resource controls and safe fallback behavior.
+This README is intentionally written for first-time deployers and non-technical readers who want to set up the project on Raspberry Pi 5 from scratch.
 
 ---
 
-## 1) Repository Status and Cleanup Note
+## 1. Professional Introduction
 
-This repository has been intentionally cleaned to keep source control focused on code and core runtime assets.
+SERENITY is an applied AI system designed to support structured, data-informed mental health conversations. It is not a diagnostic product. Instead, it provides:
 
-What was intentionally removed from git history in the current state:
+- conversational support through an AI assistant,
+- multimodal emotion sensing (voice and optional face frame),
+- questionnaire-based monitoring (PHQ-9, GAD-7, PCL-5),
+- professional-style risk and follow-up summaries in an admin view.
 
-- large legacy notebooks and one-off evaluation artifacts,
-- historical presentation files,
-- deprecated local LLM adapter snapshots,
-- temporary experiments and generated caches,
-- non-essential binaries not required for current runtime.
-
-What remains as the canonical production-oriented stack:
-
-- FastAPI backend in `backend/`,
-- React + Vite frontend in `frontend/`,
-- TFLite model artifacts currently referenced by backend runtime,
-- local SQLite persistence layer,
-- startup and dependency manifests.
+The architecture is designed for constrained hardware and practical field use, including edge devices such as Raspberry Pi 5.
 
 ---
 
-## 2) End-to-End Product Scope
+## 2. Motivation
 
-SERENITY currently supports the following user journey:
+Mental health support systems often fail in one of two ways:
 
-1. User authentication (register/login).
-2. Live voice interaction (microphone required).
-3. Optional camera frame analysis for FER.
-4. Parallel perception pipeline (STT + SER + FER).
-5. Emotion-fused assistant response generation.
-6. Streaming NDJSON events for real-time UI updates.
-7. Questionnaire completion and storage.
-8. User-scoped admin report with structured risk framing.
+1. They are easy to use but not clinically structured.
+2. They are clinically structured but difficult to deploy and operate.
 
----
+SERENITY is designed to bridge that gap by combining:
 
-## 3) System Architecture
+- a user-friendly web interface,
+- standard questionnaire interpretation,
+- emotion-aware interaction,
+- structured risk formulation and follow-up guidance,
+- edge-compatible engineering choices.
 
-### 3.1 Frontend (React + Vite)
-
-Frontend entry points:
-
-- `frontend/src/main.jsx`
-- `frontend/src/App.jsx`
-
-Primary UI areas:
-
-- `components/Login.jsx`: registration/login forms.
-- `components/Dashboard.jsx`: route hub for all workflows.
-- `pages/UnifiedEmotionPage.jsx`: live session orchestration, streaming parser, incremental assistant rendering, audio playback queue.
-- `pages/QuestionnairesPage.jsx`: template rendering, answer capture, submit, and history.
-- `pages/AdminPage.jsx`: risk report, metrics, timelines, and profile analytics.
-
-Key frontend architectural points:
-
-- Route-level lazy loading via React lazy + Suspense.
-- Local auth session persistence via `localStorage` key `serenity_user`.
-- NDJSON streaming consumer for `/api/interact/stream` and `/api/chat/stream`.
-- Browser speech fallback when backend TTS cannot be played.
-- Incremental list rendering for large admin chat datasets.
-
-### 3.2 Backend (FastAPI)
-
-Backend core:
-
-- `backend/main.py`: API surface, multimodal orchestration, low-overhead streaming pipeline, admin clinical evaluation engine, DB persistence integration.
-- `backend/cloud_llm_core.py`: async cloud client with connection pooling, endpoint failover, cooldown circuit-breaker, and streaming cutoff guards.
-- `backend/audio_core.py`: SER model loading and inference (TFLite backend with optional delegate).
-- `backend/emotion_core.py`: FER model loading and inference (OpenCV + TFLite).
-- `backend/database.py`: SQLAlchemy engine/session helpers, SQLite pragmas, query and persistence functions.
-- `backend/models.py`: ORM schema.
-- `backend/questionnaires_data.py`: questionnaire definitions, normalization, scoring, severity, and clinical flag logic.
-
-### 3.3 Data Layer
-
-Storage: local SQLite database (`serenity.db`).
-
-Tables:
-
-- `users`
-- `conversation_turns`
-- `sessions`
-- `emotions`
-- `questionnaire_results`
-
-SQLite performance pragmas applied at connect-time:
-
-- `journal_mode=WAL`
-- `synchronous=NORMAL`
-- `temp_store=MEMORY`
-- negative `cache_size` in KB (configurable)
-- `mmap_size=268435456`
+The goal is not to replace clinicians. The goal is to provide continuity, observability, and early signal detection in supportive workflows.
 
 ---
 
-## 4) Runtime Data Flows
+## 3. Solution Overview
 
-### 4.1 Voice Interaction Flow
+SERENITY has two major components:
 
-1. Frontend records audio (MediaRecorder) and optionally captures image frame.
-2. Backend `/api/interact` or `/api/interact/stream` receives multipart payload.
-3. Temporary audio file is created and auto-cleaned with context manager.
-4. Perception tasks run concurrently:
-	 - STT (`faster-whisper` preferred, `openai-whisper` fallback)
-	 - SER (audio TFLite)
-	 - FER (frame TFLite, if image is present)
-5. Probability fusion determines dominant emotion.
-6. User text is sent to cloud LLM client.
-7. Assistant result is persisted with emotions.
-8. Optional TTS audio is generated and returned or streamed as sentence segments.
+1. Backend (FastAPI)
+- Handles audio upload, optional image analysis, speech-to-text, emotion fusion, cloud LLM interaction, persistence, and admin analytics.
 
-### 4.2 Text Chat Flow
+2. Frontend (React + Vite)
+- Provides login, live interaction page, questionnaire workflows, and admin observatory dashboard.
 
-1. Frontend sends JSON to `/api/chat` or `/api/chat/stream`.
-2. Backend bypasses perception stack (neutral emotions).
-3. LLM result is generated and persisted.
-4. Optional TTS is produced in non-stream mode.
+Core pipeline:
 
-### 4.3 Admin Observability Flow
-
-1. Frontend requests `/api/admin/overview?username=...`.
-2. Backend gathers:
-	 - recent conversation turn summaries,
-	 - recent sessions with emotion timeline,
-	 - questionnaire results,
-	 - aggregate counts by user id.
-3. Backend computes:
-	 - top emotions,
-	 - negative emotion ratio,
-	 - distress signal rate,
-	 - emotional volatility,
-	 - symptom burden percentage from questionnaire maxima,
-	 - distress keyword signals,
-	 - screening trends,
-	 - overall screening trajectory,
-	 - risk and protective factors,
-	 - engagement score,
-	 - risk score and risk band.
-4. Summary text is generated using cloud LLM (strict 6-line clinical prompt) with deterministic fallback and summary cache.
-5. User-scoped overview payload is cached with TTL and returned.
+1. User speaks into microphone.
+2. Backend transcribes speech and predicts speech emotion.
+3. Optional face frame is analyzed for facial emotion.
+4. Results are fused into dominant emotion.
+5. Text goes to cloud LLM for response generation.
+6. Response streams back in near real time.
+7. All relevant events are persisted and summarized for admin review.
 
 ---
 
-## 5) Backend API Contract
+## 4. Technical Implementation (High-Level)
 
-Base URL (default local): `http://127.0.0.1:5000`
+### 4.1 Backend Layers
 
-### 5.1 Auth
+- API layer: FastAPI endpoints for auth, interaction, streaming, questionnaires, admin.
+- Perception layer: STT + SER + FER.
+- LLM layer: Async cloud client with fail-fast timeout, cooldown behavior, and stream safety filters.
+- Data layer: SQLite with performance pragmas (WAL, memory-oriented settings).
+- Clinical analytics layer: screening trends, distress signals, risk/protective factors, follow-up cadence.
 
-#### POST /register
-Request JSON:
+### 4.2 Frontend Layers
 
-```json
-{
-	"username": "alice",
-	"password": "secret"
-}
+- Interaction page with NDJSON stream consumer.
+- Questionnaire page with scoring and history.
+- Admin page with metrics dashboard, risk formulation, screening interpretation, and clinical summary.
+
+### 4.3 Edge Optimization Strategy
+
+- Reused model runtimes instead of loading model per request.
+- Stream token deltas to reduce payload growth.
+- LLM connection pooling and fallback URL support.
+- Bounded cache for admin overview and summary.
+- Reduced DB overhead with user-scoped counts and cached snapshots.
+
+---
+
+## 5. Technical Terminology (Plain-English Glossary)
+
+- API: A software interface that lets one program communicate with another.
+- FastAPI: A Python framework for building web APIs quickly.
+- Endpoint: A specific URL path in the backend, such as /api/chat.
+- NDJSON: Newline-delimited JSON; each line is one JSON event in a stream.
+- Streaming response: Data sent in pieces over time instead of waiting for one final payload.
+- STT (Speech-to-Text): Converting spoken audio to written text.
+- Whisper / faster-whisper: Speech transcription backends.
+- SER (Speech Emotion Recognition): Predicting emotional state from voice features.
+- FER (Facial Emotion Recognition): Predicting emotional state from face image features.
+- TFLite (TensorFlow Lite): Lightweight model runtime optimized for edge devices.
+- Delegate (XNNPACK): CPU acceleration backend for faster inference.
+- LLM (Large Language Model): Generative AI model used for assistant responses.
+- Circuit breaker (cooldown): A resilience pattern that temporarily stops requests after repeated failures to avoid repeated long waits.
+- Pooling: Reusing HTTP connections instead of recreating them each request.
+- WAL (Write-Ahead Logging): SQLite mode that improves concurrency and performance.
+- Risk formulation: Structured synthesis of risk indicators and protective factors.
+- PHQ-9 / GAD-7 / PCL-5: Standard screening questionnaires for depression, anxiety, and trauma symptoms.
+- Symptom burden: Combined estimate of current symptom intensity from screening scores.
+- Protective factors: Indicators that may reduce immediate risk.
+- Distress signals: Language patterns that may indicate increased acute burden.
+
+---
+
+## 6. Project Structure
+
+- backend/main.py: API endpoints and orchestration.
+- backend/cloud_llm_core.py: Cloud LLM client, streaming parser, resilience controls.
+- backend/audio_core.py: Speech emotion inference runtime.
+- backend/emotion_core.py: Face emotion inference runtime.
+- backend/database.py: SQLite engine config, persistence helpers, query helpers.
+- backend/models.py: ORM schema.
+- backend/questionnaires_data.py: Questionnaire templates, scoring, flags.
+- frontend/src/pages/UnifiedEmotionPage.jsx: Live interaction UX.
+- frontend/src/pages/QuestionnairesPage.jsx: Screening workflow UX.
+- frontend/src/pages/AdminPage.jsx: Clinical observability UX.
+
+---
+
+## 7. Complete Raspberry Pi 5 Deployment Guide (From Scratch)
+
+This section assumes you are starting from zero.
+
+### 7.1 Hardware and OS Prerequisites
+
+Required:
+
+- Raspberry Pi 5 (recommended 8GB RAM).
+- 64-bit Raspberry Pi OS Bookworm.
+- MicroSD or SSD storage with enough free space (at least 16GB recommended).
+- Stable internet.
+- USB microphone.
+- Optional USB camera for FER.
+
+Strongly recommended:
+
+- Wired network during setup.
+- Active cooling for sustained inference load.
+
+### 7.2 First Boot Setup
+
+On the Pi terminal:
+
+```bash
+sudo apt update
+sudo apt full-upgrade -y
+sudo reboot
 ```
 
-Response JSON:
+After reboot:
 
-```json
-{
-	"message": "Registration successful",
-	"username": "alice"
-}
+```bash
+sudo apt install -y git curl build-essential pkg-config ffmpeg libsndfile1 libatlas-base-dev libopenblas-dev liblapack-dev libglib2.0-0 libgl1
 ```
 
-Notes:
+### 7.3 Install Python Tooling
 
-- Password hashing uses bcrypt in current implementation.
+Install Python 3.11 and venv tooling (recommended for edge package compatibility):
 
-#### POST /login
-Request JSON:
-
-```json
-{
-	"username": "alice",
-	"password": "secret"
-}
+```bash
+sudo apt install -y python3.11 python3.11-venv python3-pip
+python3.11 --version
 ```
 
-Response JSON:
+Important:
 
-```json
-{
-	"message": "Login successful",
-	"username": "alice"
-}
+- If your default Python is 3.12+, keep using python3.11 for this project.
+- tflite-runtime wheels are often unavailable for some Python/architecture combinations.
+
+### 7.4 Install Node.js (Frontend)
+
+Option A (simple apt path):
+
+```bash
+sudo apt install -y nodejs npm
+node -v
+npm -v
 ```
 
-### 5.2 Questionnaires
+Option B (if apt Node is too old): install Node 20 using NodeSource.
 
-#### GET /api/questionnaires/templates
-Optional query param:
+### 7.5 Clone the Repository
 
-- `types=PHQ-9,GAD-7` (comma-separated)
-
-Returns template metadata, options, and question lists.
-
-#### POST /api/questionnaires/submit
-Request JSON:
-
-```json
-{
-	"username": "alice",
-	"questionnaire_type": "PHQ-9",
-	"answers": [1,2,0,1,1,0,2,0,0],
-	"submitted_at": "2026-04-12T12:00:00Z"
-}
+```bash
+git clone https://github.com/mtahaarif/Smart-Emotion-Recognition-and-Neural-Intervention-Technology-SERENITY-.git
+cd Smart-Emotion-Recognition-and-Neural-Intervention-Technology-SERENITY-/FYP
 ```
 
-Returns stored record ID and computed score/severity.
+### 7.6 Create and Activate Virtual Environment
 
-#### GET /api/questionnaires/history
-Query params:
-
-- `username` (required)
-- `limit` (optional)
-
-### 5.3 Admin
-
-#### GET /api/admin/overview
-Query params:
-
-- `username` (required)
-- `limit` (optional, clamped)
-- `include_answers` (optional)
-
-Returns:
-
-- professional 6-line summary,
-- summary source,
-- metrics,
-- profile,
-- computed clinical parameters,
-- top emotions,
-- recent chats/sessions/questionnaire rows,
-- flagged user object (for active flags).
-
-#### GET /api/admin/summary/stream
-Query params:
-
-- `username` (required)
-
-Returns cached summary text as NDJSON chunks (`summary_delta`) and a `summary_final` record.
-
-### 5.4 Interactions
-
-#### POST /api/interact
-Multipart form fields:
-
-- `username` (required)
-- `file` (required audio file)
-- `image` (optional base64 data URL or base64 payload)
-- `user_message` (optional fallback text)
-
-Returns `InteractResponse` with emotion fields, transcription, assistant reply, optional TTS audio, and error list.
-
-#### POST /api/interact/stream
-Same multipart inputs as `/api/interact`.
-
-Response media type: `application/x-ndjson`
-
-#### POST /api/chat
-Request JSON:
-
-```json
-{
-	"username": "alice",
-	"message": "I am feeling overwhelmed today."
-}
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
 ```
 
-Returns `InteractResponse` with neutral emotions and generated assistant text.
+### 7.7 Install Backend Dependencies on Pi
 
-#### POST /api/chat/stream
-Same payload as `/api/chat`.
+Recommended edge install:
 
-Response media type: `application/x-ndjson`
-
----
-
-## 6) Streaming NDJSON Event Protocol
-
-Backend stream events currently emitted:
-
-- `user_text`
-- `emotion`
-- `assistant_delta`
-- `assistant_sentence`
-- `assistant_sentence_tts`
-- `error`
-- `final`
-
-Admin summary stream events:
-
-- `summary_delta`
-- `summary_final`
-
-Ordering rules:
-
-- Voice stream (`/api/interact/stream`) emits `emotion` first, then `user_text`.
-- Text stream (`/api/chat/stream`) emits `user_text` first, then `emotion`.
-
-Frontend behavior:
-
-- `assistant_delta` carries token deltas only (not cumulative full text), reducing payload growth.
-- `assistant_sentence_tts` sentence audio segments are queued in sequence.
-- `final` closes turn state and confirms final response payload.
-
----
-
-## 7) Clinical Logic and Risk Formulation
-
-Questionnaire engines:
-
-- PHQ-9 scoring and severity thresholds.
-- GAD-7 scoring and severity thresholds.
-- PCL-5 scoring and severity thresholds.
-
-Admin risk construction includes:
-
-- active screening flags,
-- severity point mapping,
-- distress language pattern detection,
-- distress signal rate,
-- negative emotion ratio,
-- emotional volatility,
-- symptom burden percentage,
-- screening trajectory (`improving` / `stable` / `worsening` / `mixed`),
-- risk factors and protective factors,
-- engagement score from activity volume.
-
-Risk labels:
-
-- `stable`
-- `monitor`
-- `elevated`
-
-Summary generation strategy:
-
-- Prefer cloud LLM professional summary prompt.
-- If unavailable/timeouts/errors, deterministic fallback summary is returned.
-- Recent summary is cached to reduce repeated generation overhead and admin-page latency.
-
----
-
-## 8) Edge Performance Strategy
-
-### 8.1 Model Runtime
-
-- TFLite interpreter reuse (SER and FER).
-- Invoke locks for thread-safe interpreter calls.
-- Optional XNNPACK delegate load with CPU fallback.
-- OpenCV thread cap through environment configuration.
-
-### 8.2 Streaming and LLM
-
-- Shared async `httpx` client with configurable HTTP pools.
-- Optional endpoint failover via fallback URL list.
-- Fail-fast cooldown circuit breaker after repeated cloud failures.
-- Fast token-level artifact cutoff (`*` and `#`).
-- Rolling kill-phrase detector with bounded memory tail.
-- Delta-only streaming events to avoid O(n^2) payload growth.
-
-### 8.3 Data and Memory
-
-- SQLite WAL and memory-oriented pragmas.
-- Bounded admin response limits and user-scoped TTL cache.
-- Separate summary cache for admin clinical report generation.
-- Temporary audio file cleanup via context manager.
-
-### 8.4 Frontend UX Efficiency
-
-- Route lazy loading.
-- RequestAnimationFrame-based throttled stream UI updates.
-- Incremental chat pagination in admin view.
-
----
-
-## 9) Configuration Reference
-
-### 9.1 Backend Environment Variables
-
-The following keys are currently referenced by backend code:
-
-- `SERENITY_ADMIN_DEFAULT_LIMIT`
-- `SERENITY_ADMIN_MAX_LIMIT`
-- `SERENITY_ADMIN_OVERVIEW_CACHE_TTL_SECONDS`
-- `SERENITY_ADMIN_SUMMARY_CACHE_TTL_SECONDS`
-- `SERENITY_ADMIN_SUMMARY_TIMEOUT_SECONDS`
-- `SERENITY_EMOTION_TIMEOUT_SECONDS`
-- `SERENITY_CLOUD_LLM_CONNECT_TIMEOUT_SECONDS`
-- `SERENITY_CLOUD_LLM_COOLDOWN_SECONDS`
-- `SERENITY_CLOUD_LLM_FAILURE_THRESHOLD`
-- `SERENITY_CLOUD_LLM_FALLBACK_URLS`
-- `SERENITY_CLOUD_LLM_HTTP2`
-- `SERENITY_CLOUD_LLM_KILL_PHRASES`
-- `SERENITY_CLOUD_LLM_POOL_CONNECTIONS`
-- `SERENITY_CLOUD_LLM_POOL_MAXSIZE`
-- `SERENITY_CLOUD_LLM_TIMEOUT_SECONDS`
-- `SERENITY_CLOUD_LLM_TRUST_ENV`
-- `SERENITY_CLOUD_LLM_URL`
-- `SERENITY_FER_CV2_THREADS`
-- `SERENITY_FER_FACE_MIN_NEIGHBORS`
-- `SERENITY_FER_FACE_MIN_SIZE`
-- `SERENITY_FER_FACE_SCALE_FACTOR`
-- `SERENITY_FER_MAX_FRAME_SIDE`
-- `SERENITY_FER_TFLITE_THREADS`
-- `SERENITY_LLM_TIMEOUT_SECONDS`
-- `SERENITY_PREWARM_MODELS`
-- `SERENITY_PREWARM_WHISPER`
-- `SERENITY_SER_AUDIO_DURATION_SECONDS`
-- `SERENITY_SER_AUDIO_OFFSET_SECONDS`
-- `SERENITY_SER_AUDIO_SAMPLE_RATE`
-- `SERENITY_SER_TFLITE_THREADS`
-- `SERENITY_SQLITE_CACHE_KB`
-- `SERENITY_TFLITE_XNNPACK_DELEGATE`
-- `SERENITY_TTS_ENABLED`
-- `SERENITY_TTS_VOICE`
-- `SERENITY_WHISPER_CPU_THREADS`
-- `SERENITY_WHISPER_MODEL_SIZE`
-- `SERENITY_WHISPER_TIMEOUT_SECONDS`
-
-### 9.2 Frontend Environment Variables
-
-- `VITE_API_BASE_URL`
-- `VITE_SHOW_PROVISIONAL_ASSISTANT_TEXT`
-
-### 9.3 Practical Edge Defaults
-
-`Start_App.bat` sets practical defaults for local edge-like operation, including:
-
-- BLAS/OpenMP thread caps,
-- cloud timeout/pool values,
-- TFLite thread allocations,
-- FER constraints,
-- admin limit defaults.
-
----
-
-## 10) Setup and Local Run
-
-### 10.1 Prerequisites
-
-- Python 3.10+ recommended.
-- Node.js 18+ recommended.
-- npm.
-
-### 10.2 Python Environment
-
-```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+```bash
+pip install --extra-index-url https://www.piwheels.org/simple -r requirements-edge.txt
 ```
 
-### 10.3 Install Dependencies
+If that succeeds, continue to section 7.8.
 
-General profile:
+### 7.8 If You Get "No matching distribution found for tflite-runtime"
 
-```powershell
-pip install -r requirements.txt
+This is common on incompatible Python or wheel combinations.
+
+Run these checks:
+
+```bash
+python --version
+uname -m
 ```
 
-Edge profile:
+Expected for best compatibility:
 
-```powershell
-pip install -r requirements-edge.txt
+- Python 3.10 or 3.11
+- aarch64 (64-bit)
+
+If you are on Python 3.12+, recreate venv with Python 3.11 and retry.
+
+Fallback path (use TensorFlow Lite via tensorflow package):
+
+```bash
+grep -v '^tflite-runtime' requirements-edge.txt > requirements-edge-no-tflite.txt
+pip install --extra-index-url https://www.piwheels.org/simple -r requirements-edge-no-tflite.txt
+pip install tensorflow==2.18.0
 ```
 
-### 10.4 Frontend Dependencies
+Why fallback works:
 
-```powershell
+- Backend imports tflite_runtime first, and if unavailable it falls back to tensorflow.lite.
+
+### 7.9 Install Frontend Dependencies
+
+```bash
 cd frontend
 npm install
 cd ..
 ```
 
-### 10.5 Start Backend
+### 7.10 Run Backend (Development)
 
-```powershell
-python -m uvicorn backend.main:app --host 127.0.0.1 --port 5000
+```bash
+source .venv/bin/activate
+uvicorn backend.main:app --host 0.0.0.0 --port 5000
 ```
 
-### 10.6 Start Frontend
+### 7.11 Run Frontend (Development)
 
-```powershell
+Open another terminal:
+
+```bash
 cd frontend
-npm run dev
+npm run dev -- --host 0.0.0.0 --port 5173
 ```
 
-Open `http://localhost:5173/login`.
+Then open in browser:
 
-### 10.7 One-Click Windows Launcher
+- http://PI_IP_ADDRESS:5173/login
 
-```powershell
-Start_App.bat
-```
+### 7.12 Production Deployment (Recommended)
 
----
+#### Step A: Build frontend static assets
 
-## 11) Development and Validation Commands
-
-Backend syntax check:
-
-```powershell
-python -m py_compile backend/main.py backend/audio_core.py backend/emotion_core.py backend/cloud_llm_core.py backend/database.py backend/questionnaires_data.py backend/models.py
-```
-
-Frontend production build:
-
-```powershell
+```bash
 cd frontend
 npm run build
+cd ..
+```
+
+#### Step B: Create backend systemd service
+
+Create file /etc/systemd/system/serenity-backend.service:
+
+```ini
+[Unit]
+Description=SERENITY FastAPI Backend
+After=network.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/Smart-Emotion-Recognition-and-Neural-Intervention-Technology-SERENITY-/FYP
+Environment="PATH=/home/pi/Smart-Emotion-Recognition-and-Neural-Intervention-Technology-SERENITY-/FYP/.venv/bin"
+ExecStart=/home/pi/Smart-Emotion-Recognition-and-Neural-Intervention-Technology-SERENITY-/FYP/.venv/bin/uvicorn backend.main:app --host 0.0.0.0 --port 5000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable serenity-backend
+sudo systemctl start serenity-backend
+sudo systemctl status serenity-backend
+```
+
+#### Step C: Serve frontend with Nginx
+
+Install nginx:
+
+```bash
+sudo apt install -y nginx
+```
+
+Create /etc/nginx/sites-available/serenity:
+
+```nginx
+server {
+    listen 80;
+    server_name _;
+
+    root /home/pi/Smart-Emotion-Recognition-and-Neural-Intervention-Technology-SERENITY-/FYP/frontend/dist;
+    index index.html;
+
+    location / {
+        try_files $uri /index.html;
+    }
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:5000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+Enable site:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/serenity /etc/nginx/sites-enabled/serenity
+sudo nginx -t
+sudo systemctl restart nginx
+```
+
+Now open:
+
+- http://PI_IP_ADDRESS/login
+
+### 7.13 Configure Frontend API URL for Production
+
+Before building frontend, set:
+
+frontend/.env.production
+
+```env
+VITE_API_BASE_URL=/api
+```
+
+Then rebuild:
+
+```bash
+cd frontend
+npm run build
+cd ..
 ```
 
 ---
 
-## 12) Project Structure (Current)
+## 8. Environment Variables
 
-```text
-FYP/
-	README.md
-	Start_App.bat
-	requirements.txt
-	requirements-edge.txt
-	.gitignore
-	backend/
-		main.py
-		cloud_llm_core.py
-		audio_core.py
-		emotion_core.py
-		database.py
-		models.py
-		questionnaires_data.py
-		fer_model.tflite
-		ser_model.tflite
-	frontend/
-		package.json
-		vite.config.js
-		tailwind.config.js
-		postcss.config.js
-		index.html
-		src/
-			App.jsx
-			main.jsx
-			index.css
-			components/
-				Login.jsx
-				Dashboard.jsx
-			pages/
-				UnifiedEmotionPage.jsx
-				QuestionnairesPage.jsx
-				AdminPage.jsx
+Common variables for tuning and deployment:
+
+- SERENITY_CLOUD_LLM_URL
+- SERENITY_CLOUD_LLM_FALLBACK_URLS
+- SERENITY_CLOUD_LLM_TIMEOUT_SECONDS
+- SERENITY_CLOUD_LLM_CONNECT_TIMEOUT_SECONDS
+- SERENITY_CLOUD_LLM_FAILURE_THRESHOLD
+- SERENITY_CLOUD_LLM_COOLDOWN_SECONDS
+- SERENITY_TTS_ENABLED
+- SERENITY_TTS_VOICE
+- SERENITY_PREWARM_MODELS
+- SERENITY_PREWARM_WHISPER
+- SERENITY_WHISPER_MODEL_SIZE
+- SERENITY_WHISPER_CPU_THREADS
+- SERENITY_WHISPER_TIMEOUT_SECONDS
+- SERENITY_EMOTION_TIMEOUT_SECONDS
+- SERENITY_LLM_TIMEOUT_SECONDS
+- SERENITY_ADMIN_OVERVIEW_CACHE_TTL_SECONDS
+- SERENITY_ADMIN_SUMMARY_CACHE_TTL_SECONDS
+- SERENITY_ADMIN_SUMMARY_TIMEOUT_SECONDS
+
+Example shell exports:
+
+```bash
+export SERENITY_CLOUD_LLM_URL="http://YOUR_EC2_HOST:8000/chat"
+export SERENITY_TTS_ENABLED="true"
+export SERENITY_PREWARM_MODELS="true"
 ```
 
 ---
 
-## 13) Security, Privacy, and Safety Notes
+## 9. API Overview
 
-- User credentials are hashed with bcrypt at registration.
-- CORS is open by default for development convenience and should be restricted in production.
-- Distress signal matching is keyword-based and should not be treated as diagnostic certainty.
-- This platform is a support and analytics tool, not a substitute for licensed medical diagnosis.
-- In emergency-risk contexts, local policy-compliant escalation workflows should be integrated.
+Primary backend endpoints:
 
----
-
-## 14) Known Limitations
-
-1. No JWT/session token auth layer; frontend uses localStorage user marker.
-2. No comprehensive automated test suite yet.
-3. Cloud LLM availability depends on external endpoint reliability.
-4. Legacy session/emotion tables and modern conversation turns coexist; migration unification may be desirable.
-5. Model artifact versioning and checksum validation are not yet formalized.
+- POST /register
+- POST /login
+- POST /api/interact
+- POST /api/interact/stream
+- POST /api/chat
+- POST /api/chat/stream
+- GET /api/questionnaires/templates
+- POST /api/questionnaires/submit
+- GET /api/questionnaires/history
+- GET /api/admin/overview
+- GET /api/admin/summary/stream
 
 ---
 
-## 15) Recommended Next Improvements
+## 10. Validation Checklist After Deployment
 
-1. Add token-based auth and role separation.
-2. Add backend API and frontend integration tests.
-3. Add schema migrations (Alembic) for controlled DB evolution.
-4. Add structured observability (request IDs, latency histograms, error metrics).
-5. Add model artifact manifest with hashes and startup integrity checks.
-6. Add production deployment profiles (Docker/systemd) with secure env handling.
+Run these checks in order:
+
+1. Backend health smoke test:
+
+```bash
+curl -X POST http://127.0.0.1:5000/login -H "Content-Type: application/json" -d '{"username":"test","password":"test"}'
+```
+
+2. Open frontend in browser and verify login page loads.
+3. Test text chat first (/api/chat).
+4. Test voice interaction with microphone.
+5. Test optional camera mode.
+6. Submit one questionnaire and verify history.
+7. Open admin page and verify:
+- Metrics Dashboard,
+- Risk Formulation,
+- Screening interpretations,
+- Summary generation.
 
 ---
 
-## 16) License and Third-Party Assets
+## 11. Troubleshooting Guide
 
-Use and distribution must follow:
+### 11.1 tflite-runtime Not Found
 
-- this repository license,
-- licenses of Python/Node dependencies,
-- licenses and terms of model artifacts,
-- deployment-region privacy and healthcare compliance requirements where applicable.
+Symptom:
+
+- ERROR: No matching distribution found for tflite-runtime
+
+Fix:
+
+1. Use Python 3.11 venv.
+2. Use 64-bit Raspberry Pi OS.
+3. Use piwheels index URL.
+4. If still failing, install without tflite-runtime and add tensorflow==2.18.0 fallback.
+
+### 11.2 NumPy Version Compatibility Errors
+
+Symptom:
+
+- pip says some numpy versions require different Python.
+
+Fix:
+
+- Do not force random numpy versions.
+- Use the pinned requirements with supported Python (3.10/3.11).
+
+### 11.3 Backend Starts But Frontend Cannot Reach API
+
+Fix:
+
+- Ensure backend host is 0.0.0.0.
+- Ensure VITE_API_BASE_URL is correct.
+- If using nginx, ensure /api is proxied to 127.0.0.1:5000.
+
+### 11.4 Camera or Microphone Not Working
+
+Fix:
+
+- Check browser permissions.
+- Test with Chromium on Pi.
+- Confirm USB device visibility with arecord -l and v4l2-ctl --list-devices.
+
+### 11.5 Slow Inference on Pi
+
+Fix:
+
+- Use edge dependency profile.
+- Keep FER optional if camera not needed.
+- Reduce concurrent load.
+- Keep cooling active to avoid thermal throttling.
+
+---
+
+## 12. Security, Privacy, and Clinical Safety Notes
+
+- SERENITY is a support and observability system, not a diagnostic authority.
+- Distress keyword detection is heuristic and can produce false positives/negatives.
+- Always align usage with local privacy regulations.
+- Restrict CORS and enforce proper authentication before internet exposure.
+- For high-risk contexts, integrate mandatory human escalation workflows.
+
+---
+
+## 13. Operational Recommendations for Raspberry Pi 5
+
+- Keep swap enabled but monitor memory pressure.
+- Use SSD storage if available for better IO consistency.
+- Prefer wired ethernet for stable cloud LLM latency.
+- Schedule regular updates:
+
+```bash
+sudo apt update && sudo apt upgrade -y
+```
+
+- Monitor service logs:
+
+```bash
+sudo journalctl -u serenity-backend -f
+```
+
+---
+
+## 14. Final Notes for First-Time Deployers
+
+If you are new to deployment, follow this order:
+
+1. Get backend running first.
+2. Test API with simple text request.
+3. Start frontend and verify login and chat.
+4. Add voice and camera testing.
+5. Configure production services only after development flow works.
+
+This approach isolates problems and avoids debugging everything at once.
+
+---
+
+## 15. License and Third-Party Components
+
+Use of this repository must follow:
+
+- repository license terms,
+- third-party package licenses,
+- model and service licenses,
+- applicable health, privacy, and data governance requirements in your region.
