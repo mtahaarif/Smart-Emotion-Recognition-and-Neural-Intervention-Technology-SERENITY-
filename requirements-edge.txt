@@ -1,5 +1,6 @@
 # SERENITY edge profile (Raspberry Pi 5 oriented)
 # Install with: pip install -r requirements-edge.txt
+# Supported Python runtime: 3.10 to 3.12 (3.11 recommended)
 
 fastapi==0.115.6
 uvicorn==0.32.1

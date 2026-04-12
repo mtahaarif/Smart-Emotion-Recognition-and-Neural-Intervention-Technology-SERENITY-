@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import tempfile
 import time
@@ -15,6 +16,16 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import bcrypt
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "1")
+
+MIN_SUPPORTED_PYTHON = (3, 10)
+MAX_SUPPORTED_PYTHON_EXCLUSIVE = (3, 13)
+
+if not (MIN_SUPPORTED_PYTHON <= sys.version_info[:2] < MAX_SUPPORTED_PYTHON_EXCLUSIVE):
+    raise RuntimeError(
+        "SERENITY supports Python 3.10-3.12 (3.11 recommended) for this runtime stack. "
+        f"Detected Python {sys.version.split()[0]}. "
+        "Please create the virtual environment with python3.11 and reinstall dependencies."
+    )
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Depends
 from fastapi.concurrency import run_in_threadpool

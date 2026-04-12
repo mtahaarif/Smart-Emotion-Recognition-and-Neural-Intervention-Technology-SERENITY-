@@ -124,6 +124,23 @@ Core pipeline:
 - frontend/src/pages/QuestionnairesPage.jsx: Screening workflow UX.
 - frontend/src/pages/AdminPage.jsx: Clinical observability UX.
 
+### 6.1 What Is Tracked In GitHub (And What Is Not)
+
+Tracked in repository:
+
+- source code,
+- requirement files,
+- startup/config scripts,
+- frontend and backend application files.
+
+Not tracked in repository:
+
+- local virtual environments such as .venv,
+- system packages installed via apt,
+- machine-specific caches and compiled binary wheels.
+
+This is expected behavior. Anyone cloning the project must create a fresh local environment and install dependencies on their own device.
+
 ---
 
 ## 7. Complete Raspberry Pi 5 Deployment Guide (From Scratch)
@@ -173,8 +190,10 @@ python3.11 --version
 
 Important:
 
-- If your default Python is 3.12+, keep using python3.11 for this project.
-- tflite-runtime wheels are often unavailable for some Python/architecture combinations.
+- Supported runtime for this project: Python 3.10 to 3.12.
+- Recommended runtime on Raspberry Pi 5: Python 3.11.
+- Python 3.13 is currently unsupported for this stack due binary wheel compatibility (NumPy/OpenCV/TFLite/TensorFlow ecosystem constraints).
+- tflite-runtime wheels are often unavailable for some Python and architecture combinations.
 
 ### 7.4 Install Node.js (Frontend)
 
@@ -192,7 +211,7 @@ Option B (if apt Node is too old): install Node 20 using NodeSource.
 
 ```bash
 git clone https://github.com/mtahaarif/Smart-Emotion-Recognition-and-Neural-Intervention-Technology-SERENITY-.git
-cd Smart-Emotion-Recognition-and-Neural-Intervention-Technology-SERENITY-/FYP
+cd Smart-Emotion-Recognition-and-Neural-Intervention-Technology-SERENITY-
 ```
 
 ### 7.6 Create and Activate Virtual Environment
@@ -213,6 +232,13 @@ pip install --extra-index-url https://www.piwheels.org/simple -r requirements-ed
 
 If that succeeds, continue to section 7.8.
 
+Optional automation:
+
+```bash
+chmod +x scripts/setup_rpi5.sh
+./scripts/setup_rpi5.sh
+```
+
 ### 7.8 If You Get "No matching distribution found for tflite-runtime"
 
 This is common on incompatible Python or wheel combinations.
@@ -229,7 +255,15 @@ Expected for best compatibility:
 - Python 3.10 or 3.11
 - aarch64 (64-bit)
 
-If you are on Python 3.12+, recreate venv with Python 3.11 and retry.
+If you are on Python 3.13, recreate venv with Python 3.11 and retry:
+
+```bash
+deactivate 2>/dev/null || true
+rm -rf .venv
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+```
 
 Fallback path (use TensorFlow Lite via tensorflow package):
 
@@ -469,11 +503,17 @@ Fix:
 Symptom:
 
 - pip says some numpy versions require different Python.
+- Runtime errors such as:
+    - A module that was compiled using NumPy 1.x cannot be run in NumPy 2.x
+    - AttributeError: _ARRAY_API not found
+    - ImportError: numpy.core.multiarray failed to import
 
 Fix:
 
-- Do not force random numpy versions.
-- Use the pinned requirements with supported Python (3.10/3.11).
+- Ensure you are not using Python 3.13 for this project.
+- Recreate a clean Python 3.11 virtual environment.
+- Reinstall from requirements-edge.txt using piwheels index.
+- Do not mix incompatible wheel generations from previous failed installs.
 
 ### 11.3 Backend Starts But Frontend Cannot Reach API
 
