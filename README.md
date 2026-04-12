@@ -79,8 +79,8 @@ Key frontend architectural points:
 
 Backend core:
 
-- `backend/main.py`: API surface, orchestration, stream pipeline, risk summary pipeline, DB persistence integration.
-- `backend/cloud_llm_core.py`: optimized cloud client with pooled HTTP session, streaming token parser, hallucination/artifact cutoff logic.
+- `backend/main.py`: API surface, multimodal orchestration, low-overhead streaming pipeline, admin clinical evaluation engine, DB persistence integration.
+- `backend/cloud_llm_core.py`: async cloud client with connection pooling, endpoint failover, cooldown circuit-breaker, and streaming cutoff guards.
 - `backend/audio_core.py`: SER model loading and inference (TFLite backend with optional delegate).
 - `backend/emotion_core.py`: FER model loading and inference (OpenCV + TFLite).
 - `backend/database.py`: SQLAlchemy engine/session helpers, SQLite pragmas, query and persistence functions.
@@ -139,15 +139,20 @@ SQLite performance pragmas applied at connect-time:
 	 - recent conversation turn summaries,
 	 - recent sessions with emotion timeline,
 	 - questionnaire results,
-	 - aggregate counts.
+	 - aggregate counts by user id.
 3. Backend computes:
 	 - top emotions,
 	 - negative emotion ratio,
+	 - distress signal rate,
+	 - emotional volatility,
+	 - symptom burden percentage from questionnaire maxima,
 	 - distress keyword signals,
 	 - screening trends,
+	 - overall screening trajectory,
+	 - risk and protective factors,
 	 - engagement score,
 	 - risk score and risk band.
-4. Summary text is generated using cloud LLM (with strict formatting prompt) or fallback heuristic summary.
+4. Summary text is generated using cloud LLM (strict 6-line clinical prompt) with deterministic fallback and summary cache.
 5. User-scoped overview payload is cached with TTL and returned.
 
 ---
@@ -249,6 +254,13 @@ Returns:
 - recent chats/sessions/questionnaire rows,
 - flagged user object (for active flags).
 
+#### GET /api/admin/summary/stream
+Query params:
+
+- `username` (required)
+
+Returns cached summary text as NDJSON chunks (`summary_delta`) and a `summary_final` record.
+
 ### 5.4 Interactions
 
 #### POST /api/interact
@@ -297,6 +309,11 @@ Backend stream events currently emitted:
 - `error`
 - `final`
 
+Admin summary stream events:
+
+- `summary_delta`
+- `summary_final`
+
 Ordering rules:
 
 - Voice stream (`/api/interact/stream`) emits `emotion` first, then `user_text`.
@@ -304,7 +321,7 @@ Ordering rules:
 
 Frontend behavior:
 
-- `assistant_delta` progressively appends assistant text.
+- `assistant_delta` carries token deltas only (not cumulative full text), reducing payload growth.
 - `assistant_sentence_tts` sentence audio segments are queued in sequence.
 - `final` closes turn state and confirms final response payload.
 
@@ -323,7 +340,12 @@ Admin risk construction includes:
 - active screening flags,
 - severity point mapping,
 - distress language pattern detection,
+- distress signal rate,
 - negative emotion ratio,
+- emotional volatility,
+- symptom burden percentage,
+- screening trajectory (`improving` / `stable` / `worsening` / `mixed`),
+- risk factors and protective factors,
 - engagement score from activity volume.
 
 Risk labels:
@@ -336,7 +358,7 @@ Summary generation strategy:
 
 - Prefer cloud LLM professional summary prompt.
 - If unavailable/timeouts/errors, deterministic fallback summary is returned.
-- Recent summary is cached to reduce repeated generation overhead.
+- Recent summary is cached to reduce repeated generation overhead and admin-page latency.
 
 ---
 
@@ -351,15 +373,18 @@ Summary generation strategy:
 
 ### 8.2 Streaming and LLM
 
-- Shared requests session and configurable HTTP pools.
+- Shared async `httpx` client with configurable HTTP pools.
+- Optional endpoint failover via fallback URL list.
+- Fail-fast cooldown circuit breaker after repeated cloud failures.
 - Fast token-level artifact cutoff (`*` and `#`).
 - Rolling kill-phrase detector with bounded memory tail.
-- Conditional text normalization for lower per-token CPU cost.
+- Delta-only streaming events to avoid O(n^2) payload growth.
 
 ### 8.3 Data and Memory
 
 - SQLite WAL and memory-oriented pragmas.
 - Bounded admin response limits and user-scoped TTL cache.
+- Separate summary cache for admin clinical report generation.
 - Temporary audio file cleanup via context manager.
 
 ### 8.4 Frontend UX Efficiency
@@ -381,19 +406,27 @@ The following keys are currently referenced by backend code:
 - `SERENITY_ADMIN_OVERVIEW_CACHE_TTL_SECONDS`
 - `SERENITY_ADMIN_SUMMARY_CACHE_TTL_SECONDS`
 - `SERENITY_ADMIN_SUMMARY_TIMEOUT_SECONDS`
+- `SERENITY_EMOTION_TIMEOUT_SECONDS`
 - `SERENITY_CLOUD_LLM_CONNECT_TIMEOUT_SECONDS`
+- `SERENITY_CLOUD_LLM_COOLDOWN_SECONDS`
+- `SERENITY_CLOUD_LLM_FAILURE_THRESHOLD`
+- `SERENITY_CLOUD_LLM_FALLBACK_URLS`
+- `SERENITY_CLOUD_LLM_HTTP2`
 - `SERENITY_CLOUD_LLM_KILL_PHRASES`
 - `SERENITY_CLOUD_LLM_POOL_CONNECTIONS`
 - `SERENITY_CLOUD_LLM_POOL_MAXSIZE`
 - `SERENITY_CLOUD_LLM_TIMEOUT_SECONDS`
+- `SERENITY_CLOUD_LLM_TRUST_ENV`
 - `SERENITY_CLOUD_LLM_URL`
-- `SERENITY_EDGE_OPTIMIZED_MODE`
 - `SERENITY_FER_CV2_THREADS`
 - `SERENITY_FER_FACE_MIN_NEIGHBORS`
 - `SERENITY_FER_FACE_MIN_SIZE`
 - `SERENITY_FER_FACE_SCALE_FACTOR`
 - `SERENITY_FER_MAX_FRAME_SIDE`
 - `SERENITY_FER_TFLITE_THREADS`
+- `SERENITY_LLM_TIMEOUT_SECONDS`
+- `SERENITY_PREWARM_MODELS`
+- `SERENITY_PREWARM_WHISPER`
 - `SERENITY_SER_AUDIO_DURATION_SECONDS`
 - `SERENITY_SER_AUDIO_OFFSET_SECONDS`
 - `SERENITY_SER_AUDIO_SAMPLE_RATE`
@@ -402,7 +435,9 @@ The following keys are currently referenced by backend code:
 - `SERENITY_TFLITE_XNNPACK_DELEGATE`
 - `SERENITY_TTS_ENABLED`
 - `SERENITY_TTS_VOICE`
+- `SERENITY_WHISPER_CPU_THREADS`
 - `SERENITY_WHISPER_MODEL_SIZE`
+- `SERENITY_WHISPER_TIMEOUT_SECONDS`
 
 ### 9.2 Frontend Environment Variables
 

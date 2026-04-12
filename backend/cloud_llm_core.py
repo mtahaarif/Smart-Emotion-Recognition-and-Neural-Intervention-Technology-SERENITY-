@@ -2,221 +2,269 @@ import json
 import os
 import re
 import time
-from typing import Dict, Iterator, Optional
+from typing import AsyncIterator, List, Tuple
+import httpx
 
-import requests
+class CloudLLMError(RuntimeError): pass
 
-
-class CloudLLMError(RuntimeError):
-    pass
+BLOCK_RE = re.compile(r"[\[\]{}<>~`|Ãâð]|\([a-zA-Z\s]*\)|[\U00010000-\U0010FFFF]", re.IGNORECASE)
+MULTI_SPACE_RE = re.compile(r"\s{2,}")
 
 
 def _env_int(name: str, default: int, minimum: int = 1) -> int:
     try:
-        return max(minimum, int(os.getenv(name, str(default))))
-    except (TypeError, ValueError):
+        return max(minimum, int(os.getenv(name, str(default)).strip()))
+    except (TypeError, ValueError, AttributeError):
         return max(minimum, default)
 
 
-def _first_special_cutoff(text: str) -> int:
-    star_idx = text.find("*")
-    hash_idx = text.find("#")
-    if star_idx == -1:
-        return hash_idx
-    if hash_idx == -1:
-        return star_idx
-    return min(star_idx, hash_idx)
+def _env_float(name: str, default: float, minimum: float = 0.1) -> float:
+    try:
+        return max(minimum, float(os.getenv(name, str(default)).strip()))
+    except (TypeError, ValueError, AttributeError):
+        return max(minimum, default)
 
+
+def _parse_urls() -> List[str]:
+    primary = os.getenv("SERENITY_CLOUD_LLM_URL", "http://16.171.3.197:8000/chat").strip()
+    fallback_raw = os.getenv("SERENITY_CLOUD_LLM_FALLBACK_URLS", "")
+    urls = [primary] + [u.strip() for u in str(fallback_raw).split(",") if u.strip()]
+    deduped = []
+    for url in urls:
+        if url and url not in deduped:
+            deduped.append(url)
+    return deduped or ["http://16.171.3.197:8000/chat"]
 
 class CloudLLMClient:
-    """Edge-optimized HTTP client with low-overhead streaming cutoffs."""
-
+    """Edge-focused async client with fail-fast controls and SSE parsing."""
     __slots__ = (
-        "api_url",
-        "timeout",
-        "connect_timeout",
-        "session",
-        "_space_re",
-        "_camel_re",
+        "api_urls",
+        "active_url_idx",
+        "timeout_seconds",
+        "connect_timeout_seconds",
+        "client",
         "kill_phrases",
-        "_tail_keep",
+        "tail_keep",
+        "failure_count",
+        "failure_threshold",
+        "cooldown_seconds",
+        "cooldown_until",
     )
 
     def __init__(self) -> None:
-        self.api_url = os.getenv("SERENITY_CLOUD_LLM_URL", "http://16.171.3.197:8000/chat").strip()
-        self.timeout = _env_int("SERENITY_CLOUD_LLM_TIMEOUT_SECONDS", 60)
-        self.connect_timeout = _env_int("SERENITY_CLOUD_LLM_CONNECT_TIMEOUT_SECONDS", 5)
+        self.api_urls = _parse_urls()
+        self.active_url_idx = 0
+        self.timeout_seconds = _env_float("SERENITY_CLOUD_LLM_TIMEOUT_SECONDS", 60.0, minimum=1.0)
+        self.connect_timeout_seconds = _env_float("SERENITY_CLOUD_LLM_CONNECT_TIMEOUT_SECONDS", 3.0, minimum=0.1)
 
-        pool_connections = _env_int("SERENITY_CLOUD_LLM_POOL_CONNECTIONS", 4)
-        pool_maxsize = max(pool_connections, _env_int("SERENITY_CLOUD_LLM_POOL_MAXSIZE", 8))
-
-        self.session = requests.Session()
-        adapter = requests.adapters.HTTPAdapter(
-            pool_connections=pool_connections,
-            pool_maxsize=pool_maxsize,
-            max_retries=0,
-            pool_block=False,
+        pool_connections = _env_int("SERENITY_CLOUD_LLM_POOL_CONNECTIONS", 4, minimum=1)
+        pool_maxsize = max(pool_connections, _env_int("SERENITY_CLOUD_LLM_POOL_MAXSIZE", 8, minimum=1))
+        self.client = httpx.AsyncClient(
+            limits=httpx.Limits(
+                max_connections=pool_maxsize,
+                max_keepalive_connections=pool_connections,
+                keepalive_expiry=45.0,
+            ),
+            timeout=httpx.Timeout(
+                connect=self.connect_timeout_seconds,
+                read=self.timeout_seconds,
+                write=self.connect_timeout_seconds,
+                pool=self.connect_timeout_seconds,
+            ),
+            trust_env=os.getenv("SERENITY_CLOUD_LLM_TRUST_ENV", "false").lower() == "true",
+            http2=os.getenv("SERENITY_CLOUD_LLM_HTTP2", "false").lower() == "true",
         )
-        self.session.mount("http://", adapter)
-        self.session.mount("https://", adapter)
 
-        self._space_re = re.compile(r"\s+")
-        self._camel_re = re.compile(r"([a-z])([A-Z])")
-
-        raw_phrases = os.getenv(
-            "SERENITY_CLOUD_LLM_KILL_PHRASES",
-            "user:,assistant:,reflecting,follow-up",
-        )
+        raw_kill_phrases = os.getenv("SERENITY_CLOUD_LLM_KILL_PHRASES", "user:,assistant:,reflecting,follow-up")
         self.kill_phrases = tuple(
             phrase.strip().lower()
-            for phrase in str(raw_phrases).split(",")
+            for phrase in str(raw_kill_phrases).split(",")
             if phrase.strip()
         )
-        max_phrase_len = max((len(phrase) for phrase in self.kill_phrases), default=0)
-        self._tail_keep = max(0, max_phrase_len - 1)
+        self.tail_keep = max(0, max((len(phrase) for phrase in self.kill_phrases), default=0) - 1)
 
-    def _clean_text(self, text: str) -> str:
+        self.failure_count = 0
+        self.failure_threshold = _env_int("SERENITY_CLOUD_LLM_FAILURE_THRESHOLD", 3, minimum=1)
+        self.cooldown_seconds = _env_float("SERENITY_CLOUD_LLM_COOLDOWN_SECONDS", 20.0, minimum=1.0)
+        self.cooldown_until = 0.0
+
+    def _is_cooling_down(self) -> bool:
+        return time.time() < self.cooldown_until
+
+    def _record_failure(self) -> None:
+        self.failure_count += 1
+        if self.failure_count >= self.failure_threshold:
+            self.cooldown_until = time.time() + self.cooldown_seconds
+
+    def _record_success(self) -> None:
+        self.failure_count = 0
+        self.cooldown_until = 0.0
+
+    def _iter_url_indexes(self) -> List[int]:
+        active = max(0, min(self.active_url_idx, len(self.api_urls) - 1))
+        return [active] + [idx for idx in range(len(self.api_urls)) if idx != active]
+
+    def _first_cutoff_index(self, text: str) -> int:
+        asterisk = text.find("*")
+        hash_index = text.find("#")
+        if asterisk != -1 and hash_index != -1:
+            return min(asterisk, hash_index)
+        if asterisk != -1:
+            return asterisk
+        if hash_index != -1:
+            return hash_index
+        if match := BLOCK_RE.search(text):
+            return match.start()
+        return -1
+
+    def _clean(self, text: str) -> str:
         if not text:
             return ""
         if "\r" in text:
             text = text.replace("\r", "")
-        if self._camel_re.search(text):
-            text = self._camel_re.sub(r"\1 \2", text)
-        if "\n" in text or "\t" in text or "  " in text:
-            text = self._space_re.sub(" ", text)
+        if "\n" in text or "\t" in text:
+            text = text.replace("\n", " ").replace("\t", " ")
+        if "  " in text:
+            text = MULTI_SPACE_RE.sub(" ", text)
         return text
 
-    def _find_kill_start(self, token_lower: str, tail_lower: str) -> Optional[int]:
-        if not self.kill_phrases:
-            return None
-        joined = tail_lower + token_lower
-        earliest: Optional[int] = None
+    def _trim_kill_phrase(self, text: str) -> Tuple[str, bool]:
+        lowered = text.lower()
+        best_index = -1
         for phrase in self.kill_phrases:
-            idx = joined.find(phrase)
-            if idx != -1 and (earliest is None or idx < earliest):
-                earliest = idx
-        if earliest is None:
-            return None
-        return earliest - len(tail_lower)
+            candidate = lowered.find(phrase)
+            if candidate >= 0:
+                if best_index == -1 or candidate < best_index:
+                    best_index = candidate
+        if best_index >= 0:
+            return text[:best_index], True
+        return text, False
 
-    def stream_serenity(self, user_text: str) -> Iterator[str]:
-        text = str(user_text or "").strip()
-        if not text:
-            return
-
-        tail_lower = ""
-
-        try:
-            with self.session.post(
-                self.api_url,
-                json={"text": text},
-                timeout=(self.connect_timeout, self.timeout),
-                stream=True,
-                headers={"Accept": "text/event-stream"},
-            ) as response:
-                response.raise_for_status()
-
-                for line in response.iter_lines(decode_unicode=True):
-                    if not line or not line.startswith("data:"):
-                        continue
-
-                    data = line[5:].strip()
-                    if not data or data == "[DONE]":
-                        break
-
-                    try:
-                        obj = json.loads(data)
-                    except ValueError:
-                        continue
-
-                    if obj.get("done"):
-                        break
-
-                    token = obj.get("token")
-                    if not isinstance(token, str) or not token:
-                        continue
-
-                    cutoff = _first_special_cutoff(token)
-                    if cutoff != -1:
-                        safe = self._clean_text(token[:cutoff])
-                        if safe:
-                            yield safe
-                        return
-
-                    token_lower = token.lower()
-                    kill_start = self._find_kill_start(token_lower, tail_lower)
-                    if kill_start is not None:
-                        if kill_start > 0:
-                            safe = self._clean_text(token[:kill_start])
-                            if safe:
-                                yield safe
-                        return
-
-                    cleaned = self._clean_text(token)
-                    if cleaned:
-                        yield cleaned
-
-                    if self._tail_keep:
-                        tail_lower = (tail_lower + token_lower)[-self._tail_keep :]
-
-        except requests.RequestException as exc:
-            raise CloudLLMError(f"Stream failed: {exc}") from exc
-
-    def _extract_answer_text(self, response: requests.Response) -> str:
-        content_type = str(response.headers.get("Content-Type", "")).lower()
-        if "application/json" not in content_type:
-            return str(response.text or "")
-
-        try:
-            payload = response.json()
-        except ValueError:
-            return str(response.text or "")
-
-        if not isinstance(payload, dict):
-            return ""
-
-        answer = payload.get("response") or payload.get("text")
-        if isinstance(answer, str):
-            return answer
-
-        message = payload.get("message")
-        if isinstance(message, dict):
-            content = message.get("content")
-            if isinstance(content, str):
-                return content
-
-        return ""
-
-    def ask_serenity(self, user_text: str) -> str:
-        text = str(user_text or "").strip()
-        if not text:
-            return ""
-
-        try:
-            response = self.session.post(
-                self.api_url,
-                json={"text": text},
-                timeout=(self.connect_timeout, self.timeout),
-            )
+    async def _stream_once(self, url: str, text: str) -> AsyncIterator[str]:
+        tail = ""
+        async with self.client.stream("POST", url, json={"text": text}, headers={"Accept": "text/event-stream"}) as response:
             response.raise_for_status()
+            async for line in response.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    break
+                try:
+                    payload = json.loads(data)
+                except ValueError:
+                    continue
 
-            answer = self._extract_answer_text(response)
-            cutoff = _first_special_cutoff(answer)
-            if cutoff != -1:
-                answer = answer[:cutoff]
+                if payload.get("done"):
+                    break
 
-            return self._clean_text(answer).strip()
+                token = payload.get("token")
+                if not isinstance(token, str) or not token:
+                    continue
 
-        except requests.RequestException as exc:
-            raise CloudLLMError(f"Request failed: {exc}") from exc
+                cutoff_index = self._first_cutoff_index(token)
+                if cutoff_index != -1:
+                    safe = self._clean(token[:cutoff_index])
+                    if safe:
+                        yield safe
+                    yield "<CUTOFF>"
+                    return
 
-    def warmup(self, text: str = "Hello") -> float:
-        started = time.perf_counter()
-        try:
-            self.ask_serenity(text)
-        except Exception:
-            pass
-        return time.perf_counter() - started
+                combined = (tail + token).lower()
+                if any(phrase in combined for phrase in self.kill_phrases):
+                    yield "<CUTOFF>"
+                    return
 
-    def close(self) -> None:
-        self.session.close()
+                cleaned = self._clean(token)
+                if cleaned:
+                    yield cleaned
+
+                if self.tail_keep:
+                    tail = (tail + token.lower())[-self.tail_keep:]
+
+    async def stream_serenity(self, user_text: str) -> AsyncIterator[str]:
+        if not (text := str(user_text or "").strip()):
+            return
+        if self._is_cooling_down() and len(self.api_urls) == 1:
+            raise CloudLLMError("Cloud LLM temporarily cooling down after failures")
+
+        last_error: Exception | None = None
+        url_indexes = self._iter_url_indexes()
+        for idx in url_indexes:
+            emitted_any = False
+            try:
+                async for token in self._stream_once(self.api_urls[idx], text):
+                    emitted_any = True
+                    yield token
+                self.active_url_idx = idx
+                self._record_success()
+                return
+            except (httpx.HTTPError, httpx.TimeoutException, ValueError) as exc:
+                last_error = exc
+                self._record_failure()
+                if emitted_any or idx == url_indexes[-1] or self._is_cooling_down():
+                    break
+
+        raise CloudLLMError(f"Stream failed: {last_error or 'Unknown error'}")
+
+    async def _ask_once(self, url: str, text: str, timeout_seconds: float) -> str:
+        response = await self.client.post(
+            url,
+            json={"text": text},
+            timeout=httpx.Timeout(
+                connect=self.connect_timeout_seconds,
+                read=timeout_seconds,
+                write=self.connect_timeout_seconds,
+                pool=self.connect_timeout_seconds,
+            ),
+        )
+        response.raise_for_status()
+
+        content_type = response.headers.get("Content-Type", "").lower()
+        payload = response.json() if "application/json" in content_type else {}
+        answer = payload.get("response") or payload.get("text") or payload.get("message", {}).get("content", response.text)
+        if not isinstance(answer, str):
+            return ""
+
+        cutoff_hit = False
+        cutoff_index = self._first_cutoff_index(answer)
+        if cutoff_index != -1:
+            answer = answer[:cutoff_index]
+            cutoff_hit = True
+
+        answer, phrase_cut = self._trim_kill_phrase(answer)
+        cutoff_hit = cutoff_hit or phrase_cut
+        answer = self._clean(answer).strip()
+
+        if cutoff_hit and answer:
+            punctuation_matches = list(re.finditer(r"[.!?]", answer))
+            if punctuation_matches:
+                answer = answer[: punctuation_matches[-1].end()].strip()
+        return answer
+
+    async def ask_serenity(self, user_text: str, timeout: float | None = None) -> str:
+        if not (text := str(user_text or "").strip()):
+            return ""
+        if self._is_cooling_down() and len(self.api_urls) == 1:
+            raise CloudLLMError("Cloud LLM temporarily cooling down after failures")
+
+        effective_timeout = max(1.0, float(timeout or self.timeout_seconds))
+        last_error: Exception | None = None
+
+        url_indexes = self._iter_url_indexes()
+        for idx in url_indexes:
+            try:
+                answer = await self._ask_once(self.api_urls[idx], text, effective_timeout)
+                self.active_url_idx = idx
+                self._record_success()
+                return answer
+            except (httpx.HTTPError, httpx.TimeoutException, ValueError) as exc:
+                last_error = exc
+                self._record_failure()
+                if self._is_cooling_down() and idx == url_indexes[0]:
+                    break
+
+        raise CloudLLMError(f"Request failed: {last_error or 'Unknown error'}")
+
+    async def close(self) -> None:
+        await self.client.aclose()
