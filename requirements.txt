@@ -8,6 +8,7 @@ librosa==0.10.1
 opencv-python-headless==4.8.1.78
 tensorflow==2.18.0
 requests==2.31.0
+httpx==0.28.1
 faster-whisper==1.1.1
 edge-tts==6.1.12
 wordninja==2.0.0
