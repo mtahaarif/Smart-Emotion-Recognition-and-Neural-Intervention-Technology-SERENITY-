@@ -14,6 +14,7 @@ requests==2.31.0
 httpx==0.28.1
 faster-whisper==1.1.1
 edge-tts==6.1.12
+bcrypt==4.2.1
 wordninja==2.0.0
 
 # Optional: offline knowledge-base rebuild tooling

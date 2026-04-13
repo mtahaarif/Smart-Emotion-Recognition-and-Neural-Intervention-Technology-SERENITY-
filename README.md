@@ -214,6 +214,15 @@ git clone https://github.com/mtahaarif/Smart-Emotion-Recognition-and-Neural-Inte
 cd Smart-Emotion-Recognition-and-Neural-Intervention-Technology-SERENITY-
 ```
 
+### 7.5.1 Pull Git LFS Model Files (Required)
+
+This repository stores `.tflite` model files with Git LFS. If Git LFS is not installed or pulled, model files may not load at runtime.
+
+```bash
+git lfs install
+git lfs pull
+```
+
 ### 7.6 Create and Activate Virtual Environment
 
 ```bash
@@ -406,6 +415,36 @@ cd frontend
 npm run build
 cd ..
 ```
+
+### 7.14 Windows Local Quick Start (Developer)
+
+If you are running on Windows for local development:
+
+1. Open PowerShell in the repository root (`FYP`).
+2. Create and activate a local venv inside `FYP` (recommended):
+
+```powershell
+py -3.11 -m venv .venv
+& .\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip setuptools wheel
+pip install -r requirements.txt
+```
+
+3. Install frontend dependencies:
+
+```powershell
+cd frontend
+npm install
+cd ..
+```
+
+4. Start both services:
+
+```powershell
+.\Start_App.bat
+```
+
+Note: `Start_App.bat` first checks `FYP\.venv\Scripts\python.exe` and now also falls back to `..\.venv\Scripts\python.exe` when available.
 
 ---
 

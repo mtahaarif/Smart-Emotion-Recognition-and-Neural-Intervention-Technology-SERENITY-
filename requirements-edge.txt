@@ -14,6 +14,7 @@ numpy==1.26.4
 opencv-python-headless==4.8.1.78
 faster-whisper==1.1.1
 edge-tts==6.1.12
+bcrypt==4.2.1
 wordninja==2.0.0
 
 # Prefer this lightweight runtime on edge devices instead of full TensorFlow.

@@ -26,6 +26,7 @@ echo [1/3] Starting Backend Server...
 echo.
 set "PYTHON_CMD=python"
 if exist "%~dp0.venv\Scripts\python.exe" set "PYTHON_CMD=%~dp0.venv\Scripts\python.exe"
+if exist "%~dp0..\.venv\Scripts\python.exe" if /I "%PYTHON_CMD%"=="python" set "PYTHON_CMD=%~dp0..\.venv\Scripts\python.exe"
 
 :: Edge-optimized defaults (can be overridden by existing environment variables)
 set "OMP_NUM_THREADS=1"
