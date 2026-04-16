@@ -460,6 +460,10 @@ Common variables for tuning and deployment:
 - SERENITY_CLOUD_LLM_COOLDOWN_SECONDS
 - SERENITY_TTS_ENABLED
 - SERENITY_TTS_VOICE
+- SERENITY_TTS_FALLBACK_VOICE
+- SERENITY_TTS_TIMEOUT_SECONDS
+- SERENITY_TTS_RETRIES
+- SERENITY_TTS_STREAM_MODE
 - SERENITY_PREWARM_MODELS
 - SERENITY_PREWARM_WHISPER
 - SERENITY_WHISPER_MODEL_SIZE
@@ -467,6 +471,8 @@ Common variables for tuning and deployment:
 - SERENITY_WHISPER_TIMEOUT_SECONDS
 - SERENITY_EMOTION_TIMEOUT_SECONDS
 - SERENITY_LLM_TIMEOUT_SECONDS
+- SERENITY_TFLITE_USE_EXTERNAL_DELEGATE
+- SERENITY_TFLITE_XNNPACK_DELEGATE
 - SERENITY_ADMIN_OVERVIEW_CACHE_TTL_SECONDS
 - SERENITY_ADMIN_SUMMARY_CACHE_TTL_SECONDS
 - SERENITY_ADMIN_SUMMARY_TIMEOUT_SECONDS
@@ -476,8 +482,17 @@ Example shell exports:
 ```bash
 export SERENITY_CLOUD_LLM_URL="http://YOUR_EC2_HOST:8000/chat"
 export SERENITY_TTS_ENABLED="true"
+export SERENITY_TTS_STREAM_MODE="final"
+export SERENITY_TTS_VOICE="en-US-AriaNeural"
+export SERENITY_TTS_FALLBACK_VOICE="en-GB-SoniaNeural"
+export SERENITY_TTS_RETRIES="3"
 export SERENITY_PREWARM_MODELS="true"
 ```
+
+TTS stream mode values:
+
+- sentence: synthesizes sentence chunks during token streaming (lower perceived latency, more TTS requests).
+- final: synthesizes once after final response text is ready (recommended on Raspberry Pi if Edge TTS returns repeated 403 errors).
 
 ---
 
@@ -578,6 +593,75 @@ Fix:
 - Keep FER optional if camera not needed.
 - Reduce concurrent load.
 - Keep cooling active to avoid thermal throttling.
+
+### 11.6 Edge TTS 403 on Raspberry Pi 5
+
+Symptom:
+
+- TTS failed: 403, message='Invalid response status' for speech.platform.bing.com websocket URL.
+
+Important clarification:
+
+- This is typically not a Raspberry Pi 5 hardware limitation.
+- Most cases are endpoint/network-policy or request-pattern related.
+
+Fix sequence:
+
+1. Ensure system time is synchronized:
+
+```bash
+timedatectl status
+sudo timedatectl set-ntp true
+sudo systemctl restart systemd-timesyncd
+```
+
+2. Upgrade TTS stack inside venv:
+
+```bash
+source .venv/bin/activate
+python -m pip install --upgrade edge-tts aiohttp certifi
+```
+
+3. Clear proxy variables if present:
+
+```bash
+env | grep -Ei "proxy|http_proxy|https_proxy|all_proxy"
+unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+```
+
+4. Reduce burstiness by using final-only stream TTS:
+
+```bash
+export SERENITY_TTS_STREAM_MODE="final"
+export SERENITY_TTS_RETRIES="3"
+export SERENITY_TTS_TIMEOUT_SECONDS="60"
+```
+
+5. Restart backend and retry.
+
+If 403 persists after all steps, treat it as service/network path rejection and use local fallback or disable backend TTS on Pi:
+
+```bash
+export SERENITY_TTS_ENABLED="false"
+```
+
+### 11.7 XNNPACK Delegate Warning or Delegate Destructor Error
+
+Symptom:
+
+- Warning about libtensorflowlite_xnnpack_delegate.so missing.
+- Possible Delegate.__del__ attribute warning in some tflite-runtime combinations.
+
+Fix:
+
+- Keep external delegate loading disabled on edge runtime unless explicitly required.
+- Use built-in interpreter path by default.
+
+Optional explicit control:
+
+```bash
+export SERENITY_TFLITE_USE_EXTERNAL_DELEGATE="false"
+```
 
 ---
 

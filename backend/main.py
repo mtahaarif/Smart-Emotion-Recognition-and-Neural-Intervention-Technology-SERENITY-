@@ -78,6 +78,12 @@ EMOTION_TIMEOUT_SECONDS = _env_int("SERENITY_EMOTION_TIMEOUT_SECONDS", 20)
 LLM_TIMEOUT_SECONDS = _env_int("SERENITY_LLM_TIMEOUT_SECONDS", 25)
 TTS_ENABLED = os.getenv("SERENITY_TTS_ENABLED", "true").lower() == "true"
 TTS_VOICE = os.getenv("SERENITY_TTS_VOICE", "en-GB-RyanNeural").strip()
+TTS_FALLBACK_VOICE = os.getenv("SERENITY_TTS_FALLBACK_VOICE", "").strip()
+TTS_TIMEOUT_SECONDS = _env_int("SERENITY_TTS_TIMEOUT_SECONDS", 45)
+TTS_RETRIES = _env_int("SERENITY_TTS_RETRIES", 2)
+TTS_STREAM_MODE = os.getenv("SERENITY_TTS_STREAM_MODE", "sentence").strip().lower()
+if TTS_STREAM_MODE not in {"sentence", "final"}:
+    TTS_STREAM_MODE = "sentence"
 ADMIN_DEFAULT_LIMIT = _env_int("SERENITY_ADMIN_DEFAULT_LIMIT", 300, minimum=50)
 ADMIN_MAX_LIMIT = _env_int("SERENITY_ADMIN_MAX_LIMIT", 3000, minimum=200)
 ADMIN_OVERVIEW_CACHE_TTL_SECONDS = _env_float("SERENITY_ADMIN_OVERVIEW_CACHE_TTL_SECONDS", 20.0, minimum=5.0)
@@ -401,16 +407,54 @@ def _transcribe_with_whisper(audio_path: str) -> tuple[str, Optional[str]]:
     except Exception as e: return "", f"Transcription failed: {e}"
 
 async def _generate_tts_base64(text: str) -> tuple[Optional[str], Optional[str]]:
-    if not text or not TTS_ENABLED or not edge_tts: return None, None
-    audio_path = os.path.join(tempfile.gettempdir(), f"tts_{uuid.uuid4().hex}.mp3")
-    try:
-        comm = edge_tts.Communicate(text=text, voice=TTS_VOICE)
-        await asyncio.wait_for(comm.save(audio_path), timeout=30)
-        with open(audio_path, "rb") as f: return base64.b64encode(f.read()).decode("utf-8"), None
-    except Exception as e: return None, f"TTS failed: {e}"
-    finally:
-        if os.path.exists(audio_path):
-            with contextlib.suppress(OSError): os.remove(audio_path)
+    if not text or not TTS_ENABLED or not edge_tts:
+        return None, None
+
+    voices = [TTS_VOICE]
+    if TTS_FALLBACK_VOICE and TTS_FALLBACK_VOICE not in voices:
+        voices.append(TTS_FALLBACK_VOICE)
+
+    last_error: Optional[Exception] = None
+    retry_count = max(1, TTS_RETRIES)
+
+    for voice in voices:
+        for attempt in range(1, retry_count + 1):
+            audio_path = os.path.join(tempfile.gettempdir(), f"tts_{uuid.uuid4().hex}.mp3")
+            try:
+                comm = edge_tts.Communicate(text=text, voice=voice)
+                await asyncio.wait_for(comm.save(audio_path), timeout=TTS_TIMEOUT_SECONDS)
+                with open(audio_path, "rb") as f:
+                    payload = base64.b64encode(f.read()).decode("utf-8")
+                if voice != TTS_VOICE:
+                    LOGGER.info("TTS succeeded with fallback voice: %s", voice)
+                return payload, None
+            except Exception as exc:
+                last_error = exc
+                is_forbidden = "403" in str(exc)
+                if is_forbidden:
+                    LOGGER.warning(
+                        "TTS 403 from Edge endpoint (voice=%s, attempt=%s/%s).",
+                        voice,
+                        attempt,
+                        retry_count,
+                    )
+                else:
+                    LOGGER.warning(
+                        "TTS attempt failed (voice=%s, attempt=%s/%s): %s",
+                        voice,
+                        attempt,
+                        retry_count,
+                        exc,
+                    )
+
+                if attempt < retry_count:
+                    await asyncio.sleep(0.6 * attempt)
+            finally:
+                if os.path.exists(audio_path):
+                    with contextlib.suppress(OSError):
+                        os.remove(audio_path)
+
+    return None, f"TTS failed: {last_error}"
 
 async def _run_perception_tasks(temp_audio_path: Optional[str], image_data: Optional[str]) -> Dict[str, Any]:
     async def run_task(name, func, *args):
@@ -495,7 +539,8 @@ async def _stream_chat_events(db: Session, username: str, user_text: str, domina
 
     output_queue: asyncio.Queue = asyncio.Queue(maxsize=96)
     tts_input_queue: asyncio.Queue = asyncio.Queue(maxsize=16)
-    stream_tts = bool(TTS_ENABLED and edge_tts)
+    stream_tts = bool(TTS_ENABLED and edge_tts and TTS_STREAM_MODE == "sentence")
+    final_tts = bool(TTS_ENABLED and edge_tts and TTS_STREAM_MODE == "final")
 
     async def fetch_text():
         buffer, seq = "", 0
@@ -562,6 +607,7 @@ async def _stream_chat_events(db: Session, username: str, user_text: str, domina
     
     tasks_running = len(tasks)
     final_llm_res = ""
+    final_tts_audio: Optional[str] = None
 
     while tasks_running > 0:
         event = await output_queue.get()
@@ -572,6 +618,11 @@ async def _stream_chat_events(db: Session, username: str, user_text: str, domina
             tasks_running -= 1
         else:
             yield _to_event(event)
+
+    if final_tts and final_llm_res.strip():
+        final_tts_audio, final_tts_err = await _generate_tts_base64(final_llm_res)
+        if final_tts_err:
+            yield _to_event({"type": "error", "message": final_tts_err})
 
     db_errors: List[str] = []
     await _persist_turn_safe(db, username, user_text, final_llm_res, dominant_emotion, speech_emotion, face_emotion, db_errors)
@@ -584,6 +635,7 @@ async def _stream_chat_events(db: Session, username: str, user_text: str, domina
         "dominant_emotion": dominant_emotion,
         "speech_emotion": speech_emotion,
         "face_emotion": face_emotion,
+        "tts_audio_base64": final_tts_audio,
     })
 
 # --- Endpoints ---

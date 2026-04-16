@@ -2,6 +2,7 @@ import logging
 import os
 import threading
 import warnings
+import ctypes
 from typing import Any, Dict, Optional
 import librosa
 import numpy as np
@@ -31,16 +32,46 @@ warnings.filterwarnings("ignore", message=r"PySoundFile failed.*", category=User
 warnings.filterwarnings("ignore", message=r"librosa\.core\.audio\.__audioread_load.*", category=FutureWarning)
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _is_delegate_loadable(delegate_name: str) -> bool:
+    if not delegate_name:
+        return False
+    try:
+        ctypes.CDLL(delegate_name)
+        return True
+    except OSError:
+        return False
+
+
 def _build_interpreter(model_path: str, num_threads: int) -> tuple[tflite.Interpreter, Optional[object]]:
-    delegate_name = os.getenv("SERENITY_TFLITE_XNNPACK_DELEGATE", "libtensorflowlite_xnnpack_delegate.so")
-    
-    # Windows fallback
-    if os.name == "nt" and not os.path.exists(delegate_name):
+    delegate_name = os.getenv("SERENITY_TFLITE_XNNPACK_DELEGATE", "libtensorflowlite_xnnpack_delegate.so").strip()
+    # On tflite-runtime (Pi path), rely on built-in CPU/XNNPACK unless explicitly requested.
+    use_external_delegate = _env_flag(
+        "SERENITY_TFLITE_USE_EXTERNAL_DELEGATE",
+        default=(TFLITE_BACKEND == "tensorflow-lite"),
+    )
+
+    if not use_external_delegate:
+        interpreter = tflite.Interpreter(model_path=model_path, num_threads=num_threads)
+        interpreter.allocate_tensors()
+        LOGGER.info("SER initialized without external delegate (backend=%s).", TFLITE_BACKEND)
+        return interpreter, None
+
+    if not _is_delegate_loadable(delegate_name):
+        LOGGER.warning(
+            "XNNPACK delegate '%s' not loadable, using default CPU backend.",
+            delegate_name,
+        )
         interpreter = tflite.Interpreter(model_path=model_path, num_threads=num_threads)
         interpreter.allocate_tensors()
         return interpreter, None
 
-    # ARM/Linux XNNPACK flow
     try:
         delegate = tflite.load_delegate(delegate_name)
         interpreter = tflite.Interpreter(
@@ -48,7 +79,7 @@ def _build_interpreter(model_path: str, num_threads: int) -> tuple[tflite.Interp
             experimental_delegates=[delegate], 
             num_threads=num_threads
         )
-        LOGGER.info("SER initialized with XNNPACK delegate.")
+        LOGGER.info("SER initialized with external XNNPACK delegate.")
     except Exception as exc:
         LOGGER.warning("XNNPACK delegate unavailable, using default CPU: %s", exc)
         delegate = None

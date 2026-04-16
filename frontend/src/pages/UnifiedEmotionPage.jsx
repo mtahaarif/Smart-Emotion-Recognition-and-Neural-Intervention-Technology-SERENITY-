@@ -792,6 +792,10 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
               emotion: String(event?.dominant_emotion || 'Neutral'),
             });
           }
+
+          if (event?.tts_audio_base64) {
+            enqueueStreamAudioSegment(event.tts_audio_base64, Number.MAX_SAFE_INTEGER);
+          }
         }
       },
     });
@@ -1139,6 +1143,9 @@ const UnifiedEmotionPage = ({ user, onLogout }) => {
               assistantReply: finalReply,
               emotion: String(event?.dominant_emotion || 'Neutral'),
             });
+            if (event?.tts_audio_base64) {
+              enqueueStreamAudioSegment(event.tts_audio_base64, Number.MAX_SAFE_INTEGER);
+            }
             setStatusText('Message complete. Press Speak or send another message.');
           }
         },
