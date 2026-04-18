@@ -19,6 +19,11 @@ class User(Base):
         back_populates="user",
         cascade="all, delete-orphan",
     )
+    care_plan_checkins = relationship(
+        "CarePlanCheckin",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
 
 class Session(Base):
     __tablename__ = "sessions"
@@ -66,3 +71,19 @@ class QuestionnaireResult(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
     user = relationship("User", back_populates="questionnaire_results")
+
+
+class CarePlanCheckin(Base):
+    __tablename__ = "care_plan_checkins"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    mood_rating = Column(Integer, nullable=False, default=5)
+    stress_rating = Column(Integer, nullable=False, default=5)
+    energy_rating = Column(Integer, nullable=False, default=5)
+    sleep_hours = Column(Float, nullable=False, default=7.0)
+    completed_targets_json = Column(Text, nullable=False, default="[]")
+    note = Column(Text, nullable=False, default="")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    user = relationship("User", back_populates="care_plan_checkins")

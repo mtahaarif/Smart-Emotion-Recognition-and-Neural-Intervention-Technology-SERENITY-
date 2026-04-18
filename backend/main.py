@@ -41,8 +41,9 @@ except ImportError: torch = None
 
 from backend.audio_core import initialize_audio_runtime, predict_audio_emotion
 from backend.emotion_core import initialize_face_runtime, analyze_face
-from backend.database import SessionLocal, engine, fetch_questionnaire_results, fetch_recent_sessions_with_emotions, fetch_recent_turn_summaries, persist_questionnaire_result, persist_turn
+from backend.database import SessionLocal, engine, fetch_care_plan_checkins, fetch_questionnaire_results, fetch_recent_sessions_with_emotions, fetch_recent_turn_summaries, persist_care_plan_checkin, persist_questionnaire_result, persist_turn
 from backend.cloud_llm_core import CloudLLMClient, CloudLLMError
+from backend.clinical_core import build_personalized_routine, estimate_personality_profile
 from backend.questionnaires_data import QUESTIONNAIRE_DEFINITIONS, normalize_questionnaire_type, questionnaire_clinical_flags, questionnaire_templates, score_questionnaire
 import backend.models as models
 
@@ -106,6 +107,14 @@ class AuthRequest(BaseModel): username: str; password: str
 class AuthResponse(BaseModel): message: str; username: str
 class ChatRequest(BaseModel): username: str; message: str
 class QuestionnaireSubmitRequest(BaseModel): username: str; questionnaire_type: str; answers: List[int] = Field(default_factory=list); submitted_at: Optional[str] = None
+class CarePlanCheckinRequest(BaseModel):
+    username: str
+    mood_rating: int = Field(default=5, ge=1, le=10)
+    stress_rating: int = Field(default=5, ge=1, le=10)
+    energy_rating: int = Field(default=5, ge=1, le=10)
+    sleep_hours: float = Field(default=7.0, ge=0.0, le=24.0)
+    completed_targets: List[str] = Field(default_factory=list)
+    note: str = Field(default="", max_length=800)
 class InteractResponse(BaseModel): dominant_emotion: str; speech_emotion: str; face_emotion: str; transcription: str; llm_response: str; tts_audio_base64: Optional[str] = None; tts_audio_segments_base64: List[str] = Field(default_factory=list); errors: List[str] = Field(default_factory=list)
 
 def get_db():
@@ -251,6 +260,68 @@ def _build_admin_metrics(turns: int, sessions: int, emotion_events: int, quizzes
         {"id": "risk_score", "label": "Risk Score", "value": int(risk_score), "description": "Composite score from screening severity, distress language, and affective risk."},
         {"id": "distress_signals", "label": "Distress Signals", "value": int(distress_signals), "description": "Keyword-based acute distress cues in recent user messages."},
     ]
+def _default_personality_profile() -> Dict[str, Any]:
+    return estimate_personality_profile([], {}, 0, 0.0, 0)
+
+
+def _default_personalized_routine() -> Dict[str, Any]:
+    return build_personalized_routine(
+        risk_level="stable",
+        active_flags=[],
+        dominant_emotion="neutral",
+        latest_scores={},
+        screening_trends={},
+        distress_signal_count=0,
+        negative_ratio=0.0,
+        engagement_level="low",
+        personality_profile=_default_personality_profile(),
+    )
+
+
+def _personality_trait_score(profile: Dict[str, Any], trait_key: str, fallback: float = 50.0) -> float:
+    for row in profile.get("traits", []):
+        if str(row.get("key") or "") == trait_key:
+            try:
+                return float(row.get("score", fallback))
+            except (TypeError, ValueError):
+                return float(fallback)
+    return float(fallback)
+
+
+def _summarize_checkins(checkins: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not checkins:
+        return {
+            "count": 0,
+            "avg_mood": 0.0,
+            "avg_stress": 0.0,
+            "avg_energy": 0.0,
+            "avg_sleep_hours": 0.0,
+            "recent_completed_targets": [],
+        }
+
+    def _avg(key: str) -> float:
+        values = [float(row.get(key) or 0.0) for row in checkins]
+        return round(sum(values) / max(1, len(values)), 2)
+
+    recent_targets: List[str] = []
+    seen = set()
+    for row in checkins[:5]:
+        for target in row.get("completed_targets") or []:
+            label = str(target).strip()
+            if label and label not in seen:
+                seen.add(label)
+                recent_targets.append(label)
+
+    return {
+        "count": len(checkins),
+        "avg_mood": _avg("mood_rating"),
+        "avg_stress": _avg("stress_rating"),
+        "avg_energy": _avg("energy_rating"),
+        "avg_sleep_hours": _avg("sleep_hours"),
+        "recent_completed_targets": recent_targets[:8],
+    }
+
+
 def _base_profile(username: str) -> Dict[str, Any]:
     return {
         "username": username,
@@ -278,9 +349,12 @@ def _base_profile(username: str) -> Dict[str, Any]:
         "screening": {"latest_scores": {}, "latest_severity": {}, "trends": {}},
         "engagement": {"score": 0, "level": "low"},
         "follow_up": {"primary_priority": "Continue routine supportive follow-up.", "cadence": "Weekly review with symptom monitoring."},
+        "personality_profile": _default_personality_profile(),
     }
 def _empty_admin_payload(username: str) -> Dict[str, Any]:
     profile = _base_profile(username)
+    personality_profile = _default_personality_profile()
+    personalized_routine = _default_personalized_routine()
     return {
         "generated_at": datetime.utcnow().isoformat(),
         "summary": "- Client status: no sufficient clinical data yet for formal risk stratification.\n- Affective pattern: insufficient interaction data for dominant emotion analysis.\n- Measurement-based screening: no recent PHQ-9, GAD-7, or PCL-5 results available.\n- Risk formulation: no active screening flags identified from available records.\n- Immediate follow-up focus: establish baseline screening and supportive check-in.\n- Monitoring cadence: weekly follow-up until baseline metrics are available.",
@@ -292,6 +366,8 @@ def _empty_admin_payload(username: str) -> Dict[str, Any]:
         "sessions": [],
         "questionnaire_results": [],
         "profile": profile,
+        "personality_profile": personality_profile,
+        "personalized_routine": personalized_routine,
         "clinical_parameters": {
             "risk_level": "stable",
             "risk_score": 0,
@@ -841,6 +917,25 @@ async def admin_overview(username: str, limit: int = 300, include_answers: bool 
         follow_up_priority = "Continue supportive care and reinforce resilience strategies while maintaining baseline monitoring."
         monitoring_cadence = "Biweekly to monthly check-ins with periodic screening refresh."
 
+    personality_profile = estimate_personality_profile(
+        chats=chats,
+        latest_scores=latest_scores,
+        distress_signal_count=distress_signal_count,
+        negative_ratio=neg_ratio,
+        engagement_score=engagement_score,
+    )
+    personalized_routine = build_personalized_routine(
+        risk_level=risk_level,
+        active_flags=active_flags,
+        dominant_emotion=dominant_emotion,
+        latest_scores=latest_scores,
+        screening_trends=screening_trends,
+        distress_signal_count=distress_signal_count,
+        negative_ratio=neg_ratio,
+        engagement_level=engagement_level,
+        personality_profile=personality_profile,
+    )
+
     summary_snapshot = {
         "username": user_key,
         "risk": {
@@ -871,6 +966,14 @@ async def admin_overview(username: str, limit: int = 300, include_answers: bool 
         "follow_up": {
             "primary_priority": follow_up_priority,
             "cadence": monitoring_cadence,
+        },
+        "personality": {
+            "dominant_traits": personality_profile.get("dominant_traits", []),
+            "openness": _personality_trait_score(personality_profile, "openness"),
+            "conscientiousness": _personality_trait_score(personality_profile, "conscientiousness"),
+            "extraversion": _personality_trait_score(personality_profile, "extraversion"),
+            "agreeableness": _personality_trait_score(personality_profile, "agreeableness"),
+            "neuroticism": _personality_trait_score(personality_profile, "neuroticism"),
         },
         "volume": {
             "turns": int(total_turns),
@@ -912,6 +1015,7 @@ async def admin_overview(username: str, limit: int = 300, include_answers: bool 
         },
         "engagement": summary_snapshot["engagement"],
         "follow_up": summary_snapshot["follow_up"],
+        "personality_profile": personality_profile,
     })
 
     payload = {
@@ -925,6 +1029,8 @@ async def admin_overview(username: str, limit: int = 300, include_answers: bool 
         "sessions": sessions,
         "questionnaire_results": quizzes,
         "profile": profile,
+        "personality_profile": personality_profile,
+        "personalized_routine": personalized_routine,
         "clinical_parameters": {
             "risk_level": risk_level,
             "risk_score": int(risk_score),
@@ -967,6 +1073,81 @@ async def admin_summary_stream(username: str, db: Session = Depends(get_db)):
             "summary_source": overview.get("summary_source", "fallback"),
         })
     return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+
+@app.get("/api/care-plan")
+async def care_plan(username: str, db: Session = Depends(get_db)):
+    if not str(username or "").strip():
+        raise HTTPException(400, "Username required")
+
+    overview = await admin_overview(
+        username=username,
+        limit=min(ADMIN_DEFAULT_LIMIT, 300),
+        include_answers=False,
+        db=db,
+    )
+    profile = overview.get("profile", {}) if isinstance(overview, dict) else {}
+    checkins = await run_in_threadpool(fetch_care_plan_checkins, db, username, 14)
+    checkin_summary = _summarize_checkins(checkins)
+
+    return {
+        "generated_at": datetime.utcnow().isoformat(),
+        "username": username,
+        "risk_level": profile.get("risk_level", "stable"),
+        "risk_score": int(profile.get("risk_score", 0) or 0),
+        "follow_up_priority": profile.get("follow_up_priority", "Continue routine supportive follow-up."),
+        "monitoring_cadence": profile.get("monitoring_cadence", "Weekly review with symptom monitoring."),
+        "personality_profile": overview.get("personality_profile", _default_personality_profile()),
+        "personalized_routine": overview.get("personalized_routine", _default_personalized_routine()),
+        "checkin_summary": checkin_summary,
+        "recent_checkins": checkins,
+    }
+
+
+@app.post("/api/care-plan/checkins")
+async def submit_care_plan_checkin(payload: CarePlanCheckinRequest, db: Session = Depends(get_db)):
+    username = str(payload.username or "").strip()
+    if not username:
+        raise HTTPException(400, "Username required")
+
+    saved = await run_in_threadpool(
+        persist_care_plan_checkin,
+        db,
+        username,
+        payload.mood_rating,
+        payload.stress_rating,
+        payload.energy_rating,
+        payload.sleep_hours,
+        payload.completed_targets,
+        payload.note,
+    )
+    _invalidate_admin_overview_cache(username)
+    return {
+        "message": "Saved",
+        "checkin": {
+            "id": saved.id,
+            "mood_rating": int(saved.mood_rating or 5),
+            "stress_rating": int(saved.stress_rating or 5),
+            "energy_rating": int(saved.energy_rating or 5),
+            "sleep_hours": float(saved.sleep_hours or 0.0),
+            "note": saved.note or "",
+            "created_at": saved.created_at.isoformat() if saved.created_at else None,
+        },
+    }
+
+
+@app.get("/api/care-plan/checkins")
+async def get_care_plan_checkins(username: str, limit: int = 30, db: Session = Depends(get_db)):
+    user_key = str(username or "").strip()
+    if not user_key:
+        raise HTTPException(400, "Username required")
+
+    checkins = await run_in_threadpool(fetch_care_plan_checkins, db, user_key, max(1, min(int(limit or 30), 90)))
+    return {
+        "username": user_key,
+        "summary": _summarize_checkins(checkins),
+        "checkins": checkins,
+    }
 
 @app.post("/api/interact", response_model=InteractResponse)
 async def interact(username: str = Form(...), image: Optional[str] = Form(None), file: Optional[UploadFile] = File(None), user_message: Optional[str] = Form(None), db: Session = Depends(get_db)):

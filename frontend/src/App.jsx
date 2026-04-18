@@ -6,6 +6,7 @@ const Dashboard = lazy(() => import('./components/Dashboard'));
 const UnifiedEmotionPage = lazy(() => import('./pages/UnifiedEmotionPage'));
 const AdminPage = lazy(() => import('./pages/AdminPage'));
 const QuestionnairesPage = lazy(() => import('./pages/QuestionnairesPage'));
+const CarePlanPage = lazy(() => import('./pages/CarePlanPage'));
 
 function App() {
   const [user, setUser] = useState(() => localStorage.getItem('serenity_user'));
@@ -52,6 +53,10 @@ function App() {
           <Route
             path="/questionnaires"
             element={requireAuth(<QuestionnairesPage user={user} onLogout={handleLogout} />)}
+          />
+          <Route
+            path="/care-plan"
+            element={requireAuth(<CarePlanPage user={user} onLogout={handleLogout} />)}
           />
           <Route
             path="*"

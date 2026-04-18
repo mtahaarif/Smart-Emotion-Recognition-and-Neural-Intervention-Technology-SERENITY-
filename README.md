@@ -13,6 +13,9 @@ SERENITY is an applied AI system designed to support structured, data-informed m
 - conversational support through an AI assistant,
 - multimodal emotion sensing (voice and optional face frame),
 - questionnaire-based monitoring (PHQ-9, GAD-7, PCL-5),
+- heuristic personality-pattern estimation (Big Five style support profile),
+- personalized daily routine and micro-intervention planning,
+- persistent daily check-in tracking for mood/stress/energy/sleep and target adherence,
 - professional-style risk and follow-up summaries in an admin view.
 
 The architecture is designed for constrained hardware and practical field use, including edge devices such as Raspberry Pi 5.
@@ -47,6 +50,9 @@ SERENITY has two major components:
 
 2. Frontend (React + Vite)
 - Provides login, live interaction page, questionnaire workflows, and admin observatory dashboard.
+
+3. Care-Planning Layer
+- Generates an adaptive care plan from user interactions, screening trends, distress signals, and estimated personality traits.
 
 Core pipeline:
 
@@ -120,9 +126,11 @@ Core pipeline:
 - backend/database.py: SQLite engine config, persistence helpers, query helpers.
 - backend/models.py: ORM schema.
 - backend/questionnaires_data.py: Questionnaire templates, scoring, flags.
+- backend/clinical_core.py: Personality estimation and personalized routine generation engine.
 - frontend/src/pages/UnifiedEmotionPage.jsx: Live interaction UX.
 - frontend/src/pages/QuestionnairesPage.jsx: Screening workflow UX.
 - frontend/src/pages/AdminPage.jsx: Clinical observability UX.
+- frontend/src/pages/CarePlanPage.jsx: User-facing personalized care plan and routine UI.
 
 ### 6.1 What Is Tracked In GitHub (And What Is Not)
 
@@ -511,6 +519,9 @@ Primary backend endpoints:
 - GET /api/questionnaires/history
 - GET /api/admin/overview
 - GET /api/admin/summary/stream
+- GET /api/care-plan
+- POST /api/care-plan/checkins
+- GET /api/care-plan/checkins
 
 ---
 

@@ -169,3 +169,72 @@ def fetch_recent_sessions_with_emotions(db, limit: int = 100, conversation_limit
             "timestamp": e.timestamp.isoformat() if e.timestamp else None
         } for e in sorted(session.emotions, key=lambda val: val.timestamp or datetime.min)]
     } for session in sessions]
+
+
+def persist_care_plan_checkin(
+    db,
+    username: str,
+    mood_rating: int,
+    stress_rating: int,
+    energy_rating: int,
+    sleep_hours: float,
+    completed_targets: Optional[List[str]] = None,
+    note: str = "",
+):
+    models = _get_models()
+    user = _get_or_create_user(db, username, models)
+
+    normalized_targets = [
+        _clamp_text(str(item), 128)
+        for item in (completed_targets or [])
+        if str(item).strip()
+    ]
+
+    checkin = models.CarePlanCheckin(
+        user_id=user.id,
+        mood_rating=max(1, min(10, int(mood_rating))),
+        stress_rating=max(1, min(10, int(stress_rating))),
+        energy_rating=max(1, min(10, int(energy_rating))),
+        sleep_hours=max(0.0, min(24.0, float(sleep_hours))),
+        completed_targets_json=json.dumps(normalized_targets, separators=(",", ":")),
+        note=_clamp_text(note, 800),
+    )
+    db.add(checkin)
+    db.commit()
+    db.refresh(checkin)
+    return checkin
+
+
+def fetch_care_plan_checkins(db, username: str, limit: int = 30) -> List[Dict[str, Any]]:
+    models = _get_models()
+    rows = (
+        db.query(models.CarePlanCheckin)
+        .join(models.User, models.CarePlanCheckin.user_id == models.User.id)
+        .filter(models.User.username == username)
+        .order_by(models.CarePlanCheckin.created_at.desc())
+        .limit(max(1, limit))
+        .all()
+    )
+
+    results: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            completed_targets = json.loads(row.completed_targets_json or "[]")
+            if not isinstance(completed_targets, list):
+                completed_targets = []
+        except json.JSONDecodeError:
+            completed_targets = []
+
+        results.append(
+            {
+                "id": row.id,
+                "mood_rating": int(row.mood_rating or 5),
+                "stress_rating": int(row.stress_rating or 5),
+                "energy_rating": int(row.energy_rating or 5),
+                "sleep_hours": float(row.sleep_hours or 0.0),
+                "completed_targets": [str(item) for item in completed_targets],
+                "note": row.note or "",
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+        )
+    return results
