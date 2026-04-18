@@ -16,6 +16,8 @@ SERENITY is an applied AI system designed to support structured, data-informed m
 - heuristic personality-pattern estimation (Big Five style support profile),
 - personalized daily routine and micro-intervention planning,
 - persistent daily check-in tracking for mood/stress/energy/sleep and target adherence,
+- guided CBT thought-record workflow with automatic distortion pattern detection,
+- weekly CBT progress scoring (intensity shift, completion quality, streaks, top distortions),
 - professional-style risk and follow-up summaries in an admin view.
 
 The architecture is designed for constrained hardware and practical field use, including edge devices such as Raspberry Pi 5.
@@ -131,6 +133,7 @@ Core pipeline:
 - frontend/src/pages/QuestionnairesPage.jsx: Screening workflow UX.
 - frontend/src/pages/AdminPage.jsx: Clinical observability UX.
 - frontend/src/pages/CarePlanPage.jsx: User-facing personalized care plan and routine UI.
+- frontend/src/pages/CBTWorkbenchPage.jsx: Guided CBT thought records, distortion insights, and progress tracking UI.
 
 ### 6.1 What Is Tracked In GitHub (And What Is Not)
 
@@ -522,6 +525,10 @@ Primary backend endpoints:
 - GET /api/care-plan
 - POST /api/care-plan/checkins
 - GET /api/care-plan/checkins
+- GET /api/cbt/prompts
+- POST /api/cbt/thought-records
+- GET /api/cbt/thought-records
+- GET /api/cbt/progress
 
 ---
 

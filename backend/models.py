@@ -24,6 +24,11 @@ class User(Base):
         back_populates="user",
         cascade="all, delete-orphan",
     )
+    cbt_thought_records = relationship(
+        "CBTThoughtRecord",
+        back_populates="user",
+        cascade="all, delete-orphan",
+    )
 
 class Session(Base):
     __tablename__ = "sessions"
@@ -87,3 +92,23 @@ class CarePlanCheckin(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
     user = relationship("User", back_populates="care_plan_checkins")
+
+
+class CBTThoughtRecord(Base):
+    __tablename__ = "cbt_thought_records"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    situation = Column(Text, nullable=False, default="")
+    automatic_thought = Column(Text, nullable=False, default="")
+    emotion_label = Column(String, nullable=False, default="")
+    intensity_before = Column(Integer, nullable=False, default=5)
+    cognitive_distortions_json = Column(Text, nullable=False, default="[]")
+    evidence_for = Column(Text, nullable=False, default="")
+    evidence_against = Column(Text, nullable=False, default="")
+    balanced_thought = Column(Text, nullable=False, default="")
+    intensity_after = Column(Integer, nullable=False, default=5)
+    action_plan = Column(Text, nullable=False, default="")
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    user = relationship("User", back_populates="cbt_thought_records")

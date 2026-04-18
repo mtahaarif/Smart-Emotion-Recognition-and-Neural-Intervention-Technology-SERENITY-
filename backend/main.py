@@ -41,9 +41,9 @@ except ImportError: torch = None
 
 from backend.audio_core import initialize_audio_runtime, predict_audio_emotion
 from backend.emotion_core import initialize_face_runtime, analyze_face
-from backend.database import SessionLocal, engine, fetch_care_plan_checkins, fetch_questionnaire_results, fetch_recent_sessions_with_emotions, fetch_recent_turn_summaries, persist_care_plan_checkin, persist_questionnaire_result, persist_turn
+from backend.database import SessionLocal, engine, fetch_care_plan_checkins, fetch_cbt_thought_records, fetch_cbt_weekly_progress, fetch_questionnaire_results, fetch_recent_sessions_with_emotions, fetch_recent_turn_summaries, persist_care_plan_checkin, persist_cbt_thought_record, persist_questionnaire_result, persist_turn
 from backend.cloud_llm_core import CloudLLMClient, CloudLLMError
-from backend.clinical_core import build_personalized_routine, estimate_personality_profile
+from backend.clinical_core import build_cbt_guided_prompts, build_personalized_routine, detect_cognitive_distortions, estimate_personality_profile
 from backend.questionnaires_data import QUESTIONNAIRE_DEFINITIONS, normalize_questionnaire_type, questionnaire_clinical_flags, questionnaire_templates, score_questionnaire
 import backend.models as models
 
@@ -115,6 +115,17 @@ class CarePlanCheckinRequest(BaseModel):
     sleep_hours: float = Field(default=7.0, ge=0.0, le=24.0)
     completed_targets: List[str] = Field(default_factory=list)
     note: str = Field(default="", max_length=800)
+class CBTThoughtRecordRequest(BaseModel):
+    username: str
+    situation: str = Field(default="", max_length=1000)
+    automatic_thought: str = Field(default="", max_length=1000)
+    emotion_label: str = Field(default="", max_length=64)
+    intensity_before: int = Field(default=5, ge=0, le=10)
+    evidence_for: str = Field(default="", max_length=1000)
+    evidence_against: str = Field(default="", max_length=1000)
+    balanced_thought: str = Field(default="", max_length=1000)
+    intensity_after: int = Field(default=5, ge=0, le=10)
+    action_plan: str = Field(default="", max_length=1000)
 class InteractResponse(BaseModel): dominant_emotion: str; speech_emotion: str; face_emotion: str; transcription: str; llm_response: str; tts_audio_base64: Optional[str] = None; tts_audio_segments_base64: List[str] = Field(default_factory=list); errors: List[str] = Field(default_factory=list)
 
 def get_db():
@@ -320,6 +331,50 @@ def _summarize_checkins(checkins: List[Dict[str, Any]]) -> Dict[str, Any]:
         "avg_sleep_hours": _avg("sleep_hours"),
         "recent_completed_targets": recent_targets[:8],
     }
+
+
+def _cbt_progress_guidance(progress: Dict[str, Any]) -> List[str]:
+    total_records = int(progress.get("total_records") or 0)
+    if total_records <= 0:
+        return [
+            "Complete one full thought record today to establish baseline intensity tracking.",
+            "Use concrete situations (time/place/context) instead of broad summaries.",
+            "Aim for at least three records this week for meaningful trend detection.",
+        ]
+
+    guidance: List[str] = []
+    trend = str(progress.get("trend") or "stable")
+    completion_rate = float(progress.get("completion_rate") or 0.0)
+    improvement_pct = float(progress.get("improvement_pct") or 0.0)
+    streak_days = int(progress.get("streak_days") or 0)
+
+    if trend == "improving":
+        guidance.append("Your intensity is trending down. Keep using the same reframe structure and action follow-through.")
+    elif trend == "worsening":
+        guidance.append("Distress is not yet reducing. Slow down and strengthen evidence-against plus balanced-thought quality.")
+    else:
+        guidance.append("Progress is stable. Increase specificity in your balanced thoughts to improve intensity reduction.")
+
+    if completion_rate < 60.0:
+        guidance.append("Many records are incomplete. Always add both a balanced thought and a 24-hour action step.")
+    else:
+        guidance.append("Completion quality is solid. Focus on deeper cognitive flexibility to boost gains.")
+
+    if streak_days <= 1:
+        guidance.append("Build consistency with one short daily record, even on low-intensity days.")
+    else:
+        guidance.append(f"Consistency is improving with a {streak_days}-day streak. Protect the streak with low-effort entries.")
+
+    top_distortions = progress.get("top_distortions") or []
+    if top_distortions:
+        most_common = str(top_distortions[0].get("distortion") or "").replace("_", " ").strip()
+        if most_common:
+            guidance.append(f"Target your most frequent distortion: {most_common}. Challenge it with one question before acting.")
+
+    if improvement_pct >= 20.0:
+        guidance.append("Strong reduction trend detected. Consider gradually shifting toward relapse-prevention planning.")
+
+    return guidance[:6]
 
 
 def _base_profile(username: str) -> Dict[str, Any]:
@@ -1147,6 +1202,136 @@ async def get_care_plan_checkins(username: str, limit: int = 30, db: Session = D
         "username": user_key,
         "summary": _summarize_checkins(checkins),
         "checkins": checkins,
+    }
+
+
+@app.get("/api/cbt/prompts")
+async def get_cbt_prompts(username: str, db: Session = Depends(get_db)):
+    user_key = str(username or "").strip()
+    if not user_key:
+        raise HTTPException(400, "Username required")
+
+    overview = await admin_overview(
+        username=user_key,
+        limit=min(ADMIN_DEFAULT_LIMIT, 300),
+        include_answers=False,
+        db=db,
+    )
+    profile = overview.get("profile", {}) if isinstance(overview, dict) else {}
+    latest_scores = profile.get("latest_scores", {}) if isinstance(profile, dict) else {}
+    if not isinstance(latest_scores, dict):
+        latest_scores = {}
+
+    risk_level = str(profile.get("risk_level") or "stable")
+    dominant_emotion = str(profile.get("dominant_emotion") or "neutral")
+    negative_ratio = float(profile.get("negative_emotion_ratio", 0.0) or 0.0)
+
+    prompts = build_cbt_guided_prompts(
+        risk_level=risk_level,
+        dominant_emotion=dominant_emotion,
+        latest_scores=latest_scores,
+        negative_ratio=negative_ratio,
+    )
+    weekly_progress = await run_in_threadpool(fetch_cbt_weekly_progress, db, user_key, 7)
+
+    return {
+        "username": user_key,
+        "risk_level": risk_level,
+        "dominant_emotion": dominant_emotion,
+        "prompts": prompts,
+        "weekly_progress": weekly_progress,
+        "coaching_guidance": _cbt_progress_guidance(weekly_progress),
+    }
+
+
+@app.post("/api/cbt/thought-records")
+async def submit_cbt_thought_record(payload: CBTThoughtRecordRequest, db: Session = Depends(get_db)):
+    username = str(payload.username or "").strip()
+    if not username:
+        raise HTTPException(400, "Username required")
+
+    situation = str(payload.situation or "").strip()
+    automatic_thought = str(payload.automatic_thought or "").strip()
+    balanced_thought = str(payload.balanced_thought or "").strip()
+    if not situation:
+        raise HTTPException(400, "Situation is required")
+    if not automatic_thought:
+        raise HTTPException(400, "Automatic thought is required")
+    if not balanced_thought:
+        raise HTTPException(400, "Balanced thought is required")
+
+    distortions = detect_cognitive_distortions(automatic_thought)
+    distortion_keys = [str(item.get("key") or "").strip() for item in distortions if str(item.get("key") or "").strip()]
+
+    saved = await run_in_threadpool(
+        persist_cbt_thought_record,
+        db,
+        username,
+        situation,
+        automatic_thought,
+        str(payload.emotion_label or "").strip(),
+        int(payload.intensity_before),
+        distortion_keys,
+        str(payload.evidence_for or "").strip(),
+        str(payload.evidence_against or "").strip(),
+        balanced_thought,
+        int(payload.intensity_after),
+        str(payload.action_plan or "").strip(),
+    )
+    _invalidate_admin_overview_cache(username)
+
+    weekly_progress = await run_in_threadpool(fetch_cbt_weekly_progress, db, username, 7)
+
+    return {
+        "message": "Saved",
+        "record": {
+            "id": saved.id,
+            "situation": saved.situation,
+            "automatic_thought": saved.automatic_thought,
+            "emotion_label": saved.emotion_label,
+            "intensity_before": int(saved.intensity_before or 0),
+            "intensity_after": int(saved.intensity_after or 0),
+            "balanced_thought": saved.balanced_thought,
+            "action_plan": saved.action_plan,
+            "created_at": saved.created_at.isoformat() if saved.created_at else None,
+            "intensity_change": int(saved.intensity_before or 0) - int(saved.intensity_after or 0),
+        },
+        "detected_distortions": distortions,
+        "weekly_progress": weekly_progress,
+        "coaching_guidance": _cbt_progress_guidance(weekly_progress),
+    }
+
+
+@app.get("/api/cbt/thought-records")
+async def get_cbt_thought_records(username: str, limit: int = 30, db: Session = Depends(get_db)):
+    user_key = str(username or "").strip()
+    if not user_key:
+        raise HTTPException(400, "Username required")
+
+    records = await run_in_threadpool(fetch_cbt_thought_records, db, user_key, max(1, min(int(limit or 30), 120)))
+    weekly_progress = await run_in_threadpool(fetch_cbt_weekly_progress, db, user_key, 7)
+    return {
+        "username": user_key,
+        "records": records,
+        "weekly_progress": weekly_progress,
+        "coaching_guidance": _cbt_progress_guidance(weekly_progress),
+    }
+
+
+@app.get("/api/cbt/progress")
+async def get_cbt_progress(username: str, days: int = 7, db: Session = Depends(get_db)):
+    user_key = str(username or "").strip()
+    if not user_key:
+        raise HTTPException(400, "Username required")
+
+    window_days = max(1, min(int(days or 7), 30))
+    weekly_progress = await run_in_threadpool(fetch_cbt_weekly_progress, db, user_key, window_days)
+    recent_records = await run_in_threadpool(fetch_cbt_thought_records, db, user_key, 5)
+    return {
+        "username": user_key,
+        "progress": weekly_progress,
+        "coaching_guidance": _cbt_progress_guidance(weekly_progress),
+        "recent_records": recent_records,
     }
 
 @app.post("/api/interact", response_model=InteractResponse)

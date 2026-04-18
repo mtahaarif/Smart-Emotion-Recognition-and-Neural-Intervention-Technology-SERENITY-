@@ -4,6 +4,57 @@ from typing import Any, Dict, List
 
 WORD_RE = re.compile(r"[a-zA-Z']+")
 
+DISTORTION_RULES = [
+    {
+        "key": "all_or_nothing",
+        "label": "All-or-Nothing Thinking",
+        "pattern": re.compile(r"\b(always|never|completely|totally|nothing|everything)\b", re.IGNORECASE),
+        "challenge": "What is a more balanced view between extremes?",
+    },
+    {
+        "key": "catastrophizing",
+        "label": "Catastrophizing",
+        "pattern": re.compile(r"\b(disaster|ruined|unbearable|worst|can't survive|cannot survive|hopeless)\b", re.IGNORECASE),
+        "challenge": "What is the most likely outcome, and how would I cope if it happens?",
+    },
+    {
+        "key": "mind_reading",
+        "label": "Mind Reading",
+        "pattern": re.compile(r"\b(they think|everyone thinks|he thinks|she thinks|they hate me|they will judge me)\b", re.IGNORECASE),
+        "challenge": "What direct evidence do I have for what others are thinking?",
+    },
+    {
+        "key": "fortune_telling",
+        "label": "Fortune Telling",
+        "pattern": re.compile(r"\b(i will fail|it's going to fail|it will go wrong|nothing will work)\b", re.IGNORECASE),
+        "challenge": "What are three other possible outcomes besides the worst-case one?",
+    },
+    {
+        "key": "overgeneralization",
+        "label": "Overgeneralization",
+        "pattern": re.compile(r"\b(every time|nothing ever|no one ever|everyone always|nobody)\b", re.IGNORECASE),
+        "challenge": "Can I find exceptions that show this is not true in every case?",
+    },
+    {
+        "key": "should_statements",
+        "label": "Should Statements",
+        "pattern": re.compile(r"\b(should|must|have to|ought to)\b", re.IGNORECASE),
+        "challenge": "What would a kinder, more flexible statement sound like?",
+    },
+    {
+        "key": "labeling",
+        "label": "Global Labeling",
+        "pattern": re.compile(r"\b(i am a failure|i am useless|i am broken|i am worthless|loser)\b", re.IGNORECASE),
+        "challenge": "Am I defining my whole identity by one moment or one setback?",
+    },
+    {
+        "key": "personalization",
+        "label": "Personalization",
+        "pattern": re.compile(r"\b(it's all my fault|it is all my fault|i caused everything|i ruin everything)\b", re.IGNORECASE),
+        "challenge": "Which factors were outside my control in this situation?",
+    },
+]
+
 OPENNESS_WORDS = {
     "curious",
     "explore",
@@ -316,4 +367,85 @@ def build_personalized_routine(
             "next_screenings": next_screenings,
         },
         "safety_protocol": safety_protocol,
+    }
+
+
+def detect_cognitive_distortions(thought_text: str) -> List[Dict[str, Any]]:
+    text = str(thought_text or "").strip()
+    if not text:
+        return []
+
+    findings: List[Dict[str, Any]] = []
+    for rule in DISTORTION_RULES:
+        match = rule["pattern"].search(text)
+        if not match:
+            continue
+
+        findings.append(
+            {
+                "key": rule["key"],
+                "label": rule["label"],
+                "evidence": match.group(0),
+                "challenge_prompt": rule["challenge"],
+            }
+        )
+
+    return findings
+
+
+def build_cbt_guided_prompts(
+    risk_level: str,
+    dominant_emotion: str,
+    latest_scores: Dict[str, int],
+    negative_ratio: float,
+) -> Dict[str, Any]:
+    risk = str(risk_level or "stable").lower()
+    emotion = str(dominant_emotion or "neutral").lower()
+
+    opening = [
+        "Describe one specific moment from today that felt emotionally intense.",
+        "What automatic thought showed up in that moment? Quote it exactly.",
+        "Rate how strong the emotion felt from 0 to 10.",
+    ]
+
+    if emotion in {"sad", "fear", "angry", "disgust"}:
+        opening.append("Where do you feel this in your body, and what urge comes with it?")
+
+    evidence_prompts = [
+        "What facts support this thought?",
+        "What facts do not fully support this thought?",
+        "If a close friend had this thought, what would you tell them?",
+    ]
+
+    reframe_prompts = [
+        "Write one balanced alternative thought that is realistic and compassionate.",
+        "Rate your emotion again from 0 to 10 after reframing.",
+        "Choose one small action you can take in the next 24 hours.",
+    ]
+
+    safety_reminder = "If you feel at immediate risk of self-harm, contact local emergency services right away."
+    if risk == "elevated":
+        safety_reminder = (
+            "High-risk flag detected: prioritize grounding, contact a trusted person now, and seek urgent local support if safety worsens."
+        )
+
+    focus_hint = "Build cognitive flexibility and reduce automatic negative thought dominance."
+    if latest_scores.get("GAD-7", 0) >= 10:
+        focus_hint = "Focus on probability-based thinking and uncertainty tolerance."
+    elif latest_scores.get("PHQ-9", 0) >= 10:
+        focus_hint = "Focus on hopelessness reframing and behavioral activation."
+    elif latest_scores.get("PCL-5", 0) >= 33:
+        focus_hint = "Focus on trigger grounding and present-moment orientation before reframing."
+
+    if negative_ratio >= 0.55:
+        reframe_prompts.append("Add one evidence log entry daily to interrupt negative spiral momentum.")
+
+    return {
+        "generated_at": datetime.utcnow().isoformat(),
+        "focus_hint": focus_hint,
+        "opening_prompts": opening,
+        "evidence_prompts": evidence_prompts,
+        "reframe_prompts": reframe_prompts,
+        "safety_reminder": safety_reminder,
+        "session_goal": "Create one complete thought record with a measurable intensity reduction.",
     }

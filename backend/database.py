@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import create_engine, event
@@ -238,3 +238,182 @@ def fetch_care_plan_checkins(db, username: str, limit: int = 30) -> List[Dict[st
             }
         )
     return results
+
+
+def persist_cbt_thought_record(
+    db,
+    username: str,
+    situation: str,
+    automatic_thought: str,
+    emotion_label: str,
+    intensity_before: int,
+    cognitive_distortions: Optional[List[str]] = None,
+    evidence_for: str = "",
+    evidence_against: str = "",
+    balanced_thought: str = "",
+    intensity_after: int = 5,
+    action_plan: str = "",
+    created_at: Optional[datetime] = None,
+):
+    models = _get_models()
+    user = _get_or_create_user(db, username, models)
+
+    normalized_distortions = [
+        _clamp_text(str(item), 64)
+        for item in (cognitive_distortions or [])
+        if str(item).strip()
+    ]
+
+    record = models.CBTThoughtRecord(
+        user_id=user.id,
+        situation=_clamp_text(situation, 1000),
+        automatic_thought=_clamp_text(automatic_thought, 1000),
+        emotion_label=_clamp_text(emotion_label, 64),
+        intensity_before=max(0, min(10, int(intensity_before))),
+        cognitive_distortions_json=json.dumps(normalized_distortions, separators=(",", ":")),
+        evidence_for=_clamp_text(evidence_for, 1000),
+        evidence_against=_clamp_text(evidence_against, 1000),
+        balanced_thought=_clamp_text(balanced_thought, 1000),
+        intensity_after=max(0, min(10, int(intensity_after))),
+        action_plan=_clamp_text(action_plan, 1000),
+        created_at=created_at or datetime.utcnow(),
+    )
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def fetch_cbt_thought_records(db, username: str, limit: int = 50) -> List[Dict[str, Any]]:
+    models = _get_models()
+    rows = (
+        db.query(models.CBTThoughtRecord)
+        .join(models.User, models.CBTThoughtRecord.user_id == models.User.id)
+        .filter(models.User.username == username)
+        .order_by(models.CBTThoughtRecord.created_at.desc())
+        .limit(max(1, limit))
+        .all()
+    )
+
+    payload: List[Dict[str, Any]] = []
+    for row in rows:
+        try:
+            distortions = json.loads(row.cognitive_distortions_json or "[]")
+            if not isinstance(distortions, list):
+                distortions = []
+        except json.JSONDecodeError:
+            distortions = []
+
+        payload.append(
+            {
+                "id": row.id,
+                "situation": row.situation or "",
+                "automatic_thought": row.automatic_thought or "",
+                "emotion_label": row.emotion_label or "",
+                "intensity_before": int(row.intensity_before or 0),
+                "cognitive_distortions": [str(item) for item in distortions],
+                "evidence_for": row.evidence_for or "",
+                "evidence_against": row.evidence_against or "",
+                "balanced_thought": row.balanced_thought or "",
+                "intensity_after": int(row.intensity_after or 0),
+                "action_plan": row.action_plan or "",
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+        )
+    return payload
+
+
+def fetch_cbt_weekly_progress(db, username: str, days: int = 7) -> Dict[str, Any]:
+    models = _get_models()
+    window_days = max(1, min(int(days or 7), 30))
+    cutoff = datetime.utcnow() - timedelta(days=window_days)
+
+    rows = (
+        db.query(models.CBTThoughtRecord)
+        .join(models.User, models.CBTThoughtRecord.user_id == models.User.id)
+        .filter(models.User.username == username)
+        .filter(models.CBTThoughtRecord.created_at >= cutoff)
+        .order_by(models.CBTThoughtRecord.created_at.desc())
+        .all()
+    )
+
+    if not rows:
+        return {
+            "window_days": window_days,
+            "total_records": 0,
+            "avg_intensity_before": 0.0,
+            "avg_intensity_after": 0.0,
+            "avg_intensity_reduction": 0.0,
+            "improvement_pct": 0.0,
+            "completion_rate": 0.0,
+            "streak_days": 0,
+            "top_distortions": [],
+            "trend": "insufficient_data",
+        }
+
+    total = len(rows)
+    before_values = [int(row.intensity_before or 0) for row in rows]
+    after_values = [int(row.intensity_after or 0) for row in rows]
+    avg_before = round(sum(before_values) / max(1, total), 2)
+    avg_after = round(sum(after_values) / max(1, total), 2)
+    reduction = round(avg_before - avg_after, 2)
+    improvement_pct = round((reduction / avg_before) * 100.0, 2) if avg_before > 0 else 0.0
+
+    complete_count = 0
+    distortion_counts: Dict[str, int] = {}
+    days_with_records = set()
+
+    for row in rows:
+        if str(row.balanced_thought or "").strip() and str(row.action_plan or "").strip():
+            complete_count += 1
+        if row.created_at:
+            days_with_records.add(row.created_at.date())
+
+        try:
+            distortions = json.loads(row.cognitive_distortions_json or "[]")
+            if not isinstance(distortions, list):
+                distortions = []
+        except json.JSONDecodeError:
+            distortions = []
+
+        for distortion in distortions:
+            key = str(distortion).strip().lower()
+            if key:
+                distortion_counts[key] = distortion_counts.get(key, 0) + 1
+
+    completion_rate = round((complete_count / max(1, total)) * 100.0, 2)
+
+    today = datetime.utcnow().date()
+    streak = 0
+    for i in range(window_days):
+        day = today - timedelta(days=i)
+        if day in days_with_records:
+            streak += 1
+        else:
+            break
+
+    ranked_distortions = sorted(
+        [{"distortion": key, "count": count} for key, count in distortion_counts.items()],
+        key=lambda item: item["count"],
+        reverse=True,
+    )
+
+    if reduction >= 1.0 and improvement_pct >= 10.0:
+        trend = "improving"
+    elif reduction <= -0.5:
+        trend = "worsening"
+    else:
+        trend = "stable"
+
+    return {
+        "window_days": window_days,
+        "total_records": total,
+        "avg_intensity_before": avg_before,
+        "avg_intensity_after": avg_after,
+        "avg_intensity_reduction": reduction,
+        "improvement_pct": improvement_pct,
+        "completion_rate": completion_rate,
+        "streak_days": streak,
+        "top_distortions": ranked_distortions[:6],
+        "trend": trend,
+    }
