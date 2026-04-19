@@ -8,6 +8,7 @@ const AdminPage = lazy(() => import('./pages/AdminPage'));
 const QuestionnairesPage = lazy(() => import('./pages/QuestionnairesPage'));
 const CarePlanPage = lazy(() => import('./pages/CarePlanPage'));
 const CBTWorkbenchPage = lazy(() => import('./pages/CBTWorkbenchPage'));
+const ClinicalHandoffPage = lazy(() => import('./pages/ClinicalHandoffPage'));
 
 function App() {
   const [user, setUser] = useState(() => localStorage.getItem('serenity_user'));
@@ -62,6 +63,10 @@ function App() {
           <Route
             path="/cbt-workbench"
             element={requireAuth(<CBTWorkbenchPage user={user} onLogout={handleLogout} />)}
+          />
+          <Route
+            path="/clinical-handoff"
+            element={requireAuth(<ClinicalHandoffPage user={user} onLogout={handleLogout} />)}
           />
           <Route
             path="*"

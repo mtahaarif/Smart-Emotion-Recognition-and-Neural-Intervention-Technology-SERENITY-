@@ -43,7 +43,7 @@ from backend.audio_core import initialize_audio_runtime, predict_audio_emotion
 from backend.emotion_core import initialize_face_runtime, analyze_face
 from backend.database import SessionLocal, engine, fetch_care_plan_checkins, fetch_cbt_thought_records, fetch_cbt_weekly_progress, fetch_questionnaire_results, fetch_recent_sessions_with_emotions, fetch_recent_turn_summaries, persist_care_plan_checkin, persist_cbt_thought_record, persist_questionnaire_result, persist_turn
 from backend.cloud_llm_core import CloudLLMClient, CloudLLMError
-from backend.clinical_core import build_cbt_guided_prompts, build_personalized_routine, detect_cognitive_distortions, estimate_personality_profile
+from backend.clinical_core import build_cbt_guided_prompts, build_clinician_handoff_report, build_personalized_routine, detect_cognitive_distortions, estimate_personality_profile, forecast_relapse_risk
 from backend.questionnaires_data import QUESTIONNAIRE_DEFINITIONS, normalize_questionnaire_type, questionnaire_clinical_flags, questionnaire_templates, score_questionnaire
 import backend.models as models
 
@@ -1332,6 +1332,89 @@ async def get_cbt_progress(username: str, days: int = 7, db: Session = Depends(g
         "progress": weekly_progress,
         "coaching_guidance": _cbt_progress_guidance(weekly_progress),
         "recent_records": recent_records,
+    }
+
+
+@app.get("/api/relapse-forecast")
+async def get_relapse_forecast(username: str, db: Session = Depends(get_db)):
+    user_key = str(username or "").strip()
+    if not user_key:
+        raise HTTPException(400, "Username required")
+
+    overview = await admin_overview(
+        username=user_key,
+        limit=min(ADMIN_DEFAULT_LIMIT, 300),
+        include_answers=False,
+        db=db,
+    )
+    profile = overview.get("profile", {}) if isinstance(overview, dict) else {}
+    clinical_parameters = overview.get("clinical_parameters", {}) if isinstance(overview, dict) else {}
+
+    checkins = await run_in_threadpool(fetch_care_plan_checkins, db, user_key, 14)
+    checkin_summary = _summarize_checkins(checkins)
+    cbt_progress = await run_in_threadpool(fetch_cbt_weekly_progress, db, user_key, 7)
+
+    forecast = forecast_relapse_risk(
+        profile=profile,
+        clinical_parameters=clinical_parameters,
+        cbt_progress=cbt_progress,
+        checkin_summary=checkin_summary,
+    )
+
+    return {
+        "generated_at": datetime.utcnow().isoformat(),
+        "username": user_key,
+        "forecast": forecast,
+        "checkin_summary": checkin_summary,
+        "cbt_progress": cbt_progress,
+        "risk_context": {
+            "risk_level": str(profile.get("risk_level") or clinical_parameters.get("risk_level") or "stable"),
+            "risk_score": int(profile.get("risk_score", clinical_parameters.get("risk_score", 0)) or 0),
+            "overall_trend": str(profile.get("overall_trend", clinical_parameters.get("overall_trend", "insufficient_data")) or "insufficient_data"),
+        },
+    }
+
+
+@app.get("/api/clinical/handoff")
+async def get_clinical_handoff(username: str, db: Session = Depends(get_db)):
+    user_key = str(username or "").strip()
+    if not user_key:
+        raise HTTPException(400, "Username required")
+
+    overview = await admin_overview(
+        username=user_key,
+        limit=min(ADMIN_DEFAULT_LIMIT, 300),
+        include_answers=False,
+        db=db,
+    )
+    profile = overview.get("profile", {}) if isinstance(overview, dict) else {}
+    clinical_parameters = overview.get("clinical_parameters", {}) if isinstance(overview, dict) else {}
+
+    cbt_progress = await run_in_threadpool(fetch_cbt_weekly_progress, db, user_key, 7)
+    recent_cbt_records = await run_in_threadpool(fetch_cbt_thought_records, db, user_key, 8)
+    checkins = await run_in_threadpool(fetch_care_plan_checkins, db, user_key, 14)
+    checkin_summary = _summarize_checkins(checkins)
+
+    forecast = forecast_relapse_risk(
+        profile=profile,
+        clinical_parameters=clinical_parameters,
+        cbt_progress=cbt_progress,
+        checkin_summary=checkin_summary,
+    )
+    handoff = build_clinician_handoff_report(
+        username=user_key,
+        overview=overview,
+        cbt_progress=cbt_progress,
+        recent_cbt_records=recent_cbt_records,
+        checkin_summary=checkin_summary,
+        relapse_forecast=forecast,
+    )
+
+    return {
+        "generated_at": datetime.utcnow().isoformat(),
+        "username": user_key,
+        "forecast": forecast,
+        "handoff": handoff,
     }
 
 @app.post("/api/interact", response_model=InteractResponse)

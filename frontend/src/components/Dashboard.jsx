@@ -1,5 +1,5 @@
 import React from 'react';
-import { Activity, ClipboardList, Compass, FileText, LogOut, Radar, Shield } from 'lucide-react';
+import { Activity, ClipboardList, Compass, FileText, LogOut, Radar, Shield, TrendingUp } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 
 const Dashboard = ({ user, onLogout }) => {
@@ -51,6 +51,15 @@ const Dashboard = ({ user, onLogout }) => {
       to: '/cbt-workbench',
       buttonClass: 'bg-fuchsia-700 hover:bg-fuchsia-600',
     },
+    {
+      id: 'clinical-handoff',
+      title: 'Clinical Handoff',
+      subtitle: 'Relapse forecast + transfer report',
+      description: 'Review relapse probability, warning/protective signals, and generate a structured handoff package for clinician transition.',
+      icon: TrendingUp,
+      to: '/clinical-handoff',
+      buttonClass: 'bg-rose-700 hover:bg-rose-600',
+    },
   ];
 
   return (
@@ -77,7 +86,7 @@ const Dashboard = ({ user, onLogout }) => {
             </p>
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-5 gap-4">
+          <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-6 gap-4">
             {navCards.map((card) => {
               const Icon = card.icon;
               return (

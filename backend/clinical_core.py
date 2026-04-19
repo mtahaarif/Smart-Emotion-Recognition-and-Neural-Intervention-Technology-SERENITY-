@@ -449,3 +449,369 @@ def build_cbt_guided_prompts(
         "safety_reminder": safety_reminder,
         "session_goal": "Create one complete thought record with a measurable intensity reduction.",
     }
+
+
+def _dedupe_keep_order(items: List[str]) -> List[str]:
+    seen = set()
+    output: List[str] = []
+    for item in items:
+        value = str(item or "").strip()
+        if value and value not in seen:
+            seen.add(value)
+            output.append(value)
+    return output
+
+
+def forecast_relapse_risk(
+    profile: Dict[str, Any],
+    clinical_parameters: Dict[str, Any],
+    cbt_progress: Dict[str, Any],
+    checkin_summary: Dict[str, Any],
+) -> Dict[str, Any]:
+    risk_score = int(profile.get("risk_score", clinical_parameters.get("risk_score", 0)) or 0)
+    distress_signal_count = int(
+        profile.get("distress_signal_count", clinical_parameters.get("distress_signal_count", 0)) or 0
+    )
+    negative_ratio = float(
+        profile.get("negative_emotion_ratio", clinical_parameters.get("negative_emotion_ratio", 0.0)) or 0.0
+    )
+    symptom_burden_pct = float(
+        profile.get("symptom_burden_pct", clinical_parameters.get("symptom_burden_pct", 0.0)) or 0.0
+    )
+    overall_trend = str(profile.get("overall_trend", clinical_parameters.get("overall_trend", "insufficient_data")) or "insufficient_data")
+    engagement_level = str(profile.get("engagement_level", clinical_parameters.get("engagement_level", "low")) or "low").lower()
+
+    cbt_trend = str(cbt_progress.get("trend") or "insufficient_data").lower()
+    cbt_improvement_pct = float(cbt_progress.get("improvement_pct") or 0.0)
+    cbt_completion_rate = float(cbt_progress.get("completion_rate") or 0.0)
+    cbt_streak_days = int(cbt_progress.get("streak_days") or 0)
+    cbt_total_records = int(cbt_progress.get("total_records") or 0)
+
+    checkin_count = int(checkin_summary.get("count") or 0)
+    avg_mood = float(checkin_summary.get("avg_mood") or 0.0)
+    avg_stress = float(checkin_summary.get("avg_stress") or 0.0)
+    avg_sleep = float(checkin_summary.get("avg_sleep_hours") or 0.0)
+
+    raw_points = 0.0
+    contributors: List[Dict[str, Any]] = []
+
+    def add(delta: float, reason: str) -> None:
+        nonlocal raw_points
+        raw_points += delta
+        contributors.append({"driver": reason, "impact": round(delta, 2)})
+
+    add(risk_score * 5.0, f"Current risk score contribution ({risk_score})")
+    add((symptom_burden_pct / 100.0) * 18.0, f"Symptom burden contribution ({round(symptom_burden_pct, 1)}%)")
+    add(min(12.0, distress_signal_count * 2.0), f"Distress language events ({distress_signal_count})")
+    add(max(0.0, negative_ratio) * 16.0, f"Negative affect ratio ({round(negative_ratio, 3)})")
+
+    if overall_trend == "worsening":
+        add(8.0, "Screening trend worsening")
+    elif overall_trend == "mixed":
+        add(4.0, "Screening trend mixed")
+    elif overall_trend == "improving":
+        add(-4.0, "Screening trend improving")
+
+    if cbt_trend == "worsening":
+        add(9.0, "CBT distress trend worsening")
+    elif cbt_trend == "stable":
+        add(2.0, "CBT distress trend stable")
+    elif cbt_trend == "improving":
+        add(-8.0, "CBT distress trend improving")
+    else:
+        add(3.0, "CBT trend uncertain due to limited records")
+
+    if cbt_improvement_pct >= 20.0:
+        add(-6.0, f"Strong CBT intensity reduction ({round(cbt_improvement_pct, 1)}%)")
+    elif cbt_improvement_pct <= 5.0:
+        add(4.0, f"Minimal CBT intensity reduction ({round(cbt_improvement_pct, 1)}%)")
+
+    if cbt_completion_rate >= 80.0:
+        add(-3.0, f"High CBT completion quality ({round(cbt_completion_rate, 1)}%)")
+    elif cbt_completion_rate < 50.0:
+        add(4.0, f"Low CBT completion quality ({round(cbt_completion_rate, 1)}%)")
+
+    if cbt_streak_days >= 3:
+        add(-3.0, f"Protective CBT streak ({cbt_streak_days} days)")
+    elif cbt_total_records > 0 and cbt_streak_days == 0:
+        add(3.0, "Interrupted CBT practice streak")
+
+    if checkin_count >= 3:
+        if avg_stress >= 7.0:
+            add(8.0, f"Sustained high stress in check-ins ({round(avg_stress, 1)}/10)")
+        elif avg_stress <= 4.0:
+            add(-2.0, f"Lower stress trend in check-ins ({round(avg_stress, 1)}/10)")
+
+        if avg_mood <= 4.0:
+            add(8.0, f"Low mood trend in check-ins ({round(avg_mood, 1)}/10)")
+        elif avg_mood >= 7.0:
+            add(-4.0, f"Higher mood trend in check-ins ({round(avg_mood, 1)}/10)")
+
+        if avg_sleep < 6.0:
+            add(6.0, f"Short sleep trend ({round(avg_sleep, 1)}h)")
+        elif avg_sleep >= 7.0:
+            add(-3.0, f"Protective sleep duration trend ({round(avg_sleep, 1)}h)")
+    else:
+        add(3.0, "Limited check-in coverage for stability forecasting")
+
+    if engagement_level == "low":
+        add(4.0, "Low engagement level")
+    elif engagement_level == "high":
+        add(-3.0, "High engagement level")
+
+    relapse_probability_pct = int(max(0.0, min(100.0, round(raw_points))))
+
+    if relapse_probability_pct >= 75:
+        band = "critical"
+    elif relapse_probability_pct >= 55:
+        band = "high"
+    elif relapse_probability_pct >= 35:
+        band = "moderate"
+    else:
+        band = "low"
+
+    coverage_score = 0
+    if cbt_total_records >= 3:
+        coverage_score += 1
+    if checkin_count >= 4:
+        coverage_score += 1
+    if isinstance(profile.get("latest_scores"), dict) and len(profile.get("latest_scores") or {}) > 0:
+        coverage_score += 1
+    if int(profile.get("engagement_score") or 0) >= 20:
+        coverage_score += 1
+
+    confidence = "high" if coverage_score >= 3 else "moderate" if coverage_score == 2 else "low"
+
+    warning_signs: List[str] = []
+    if distress_signal_count > 0:
+        warning_signs.append("Distress language detected in recent interactions")
+    if overall_trend in {"worsening", "mixed"}:
+        warning_signs.append(f"Screening trajectory is {overall_trend}")
+    if cbt_trend in {"worsening", "stable"} and cbt_total_records > 0:
+        warning_signs.append(f"CBT trend is {cbt_trend} with incomplete relief")
+    if checkin_count >= 3 and avg_sleep < 6.0:
+        warning_signs.append("Sleep duration is below protective threshold")
+    if checkin_count >= 3 and avg_stress >= 7.0:
+        warning_signs.append("Check-ins show sustained high stress")
+    if checkin_count < 3:
+        warning_signs.append("Insufficient recent check-ins for robust stability monitoring")
+
+    protective_signals: List[str] = []
+    if cbt_trend == "improving":
+        protective_signals.append("CBT intensity trend is improving")
+    if cbt_completion_rate >= 70.0:
+        protective_signals.append("CBT record completion quality is strong")
+    if cbt_streak_days >= 3:
+        protective_signals.append("Consistent CBT streak maintained")
+    if checkin_count >= 3 and avg_mood >= 6.5:
+        protective_signals.append("Mood trend in check-ins is generally stable to positive")
+    if checkin_count >= 3 and avg_sleep >= 7.0:
+        protective_signals.append("Sleep trend remains in protective range")
+    if engagement_level in {"moderate", "high"}:
+        protective_signals.append("Engagement level indicates continued treatment participation")
+
+    preventive_actions: List[str] = []
+    if band in {"critical", "high"}:
+        preventive_actions.extend([
+            "Schedule clinician follow-up within 24-72 hours and reassess safety plan.",
+            "Increase daily monitoring: mood/stress/sleep check-in plus one brief coping log.",
+            "Prioritize trigger management and means-restriction conversation if safety concern escalates.",
+        ])
+    elif band == "moderate":
+        preventive_actions.extend([
+            "Maintain weekly clinician review focused on trigger-response patterns.",
+            "Complete at least 4 CBT thought records this week with full evidence sections.",
+            "Reinforce sleep and behavioral activation as relapse-prevention anchors.",
+        ])
+    else:
+        preventive_actions.extend([
+            "Continue maintenance plan with weekly CBT practice and routine check-ins.",
+            "Use early warning checklist proactively when distress starts to rise.",
+            "Review resilience wins each week to preserve protective momentum.",
+        ])
+
+    if checkin_count < 3:
+        preventive_actions.append("Submit at least 4 check-ins this week to improve relapse visibility.")
+    if cbt_completion_rate < 60.0:
+        preventive_actions.append("Complete balanced thought plus action step for each CBT record to increase intervention quality.")
+
+    ranked_contributors = sorted(contributors, key=lambda row: abs(float(row.get("impact") or 0.0)), reverse=True)
+
+    return {
+        "generated_at": datetime.utcnow().isoformat(),
+        "relapse_probability_pct": relapse_probability_pct,
+        "band": band,
+        "confidence": confidence,
+        "contributors": ranked_contributors[:8],
+        "warning_signs": _dedupe_keep_order(warning_signs),
+        "protective_signals": _dedupe_keep_order(protective_signals),
+        "preventive_actions": _dedupe_keep_order(preventive_actions),
+    }
+
+
+def _screening_rows(profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+    latest_scores = profile.get("latest_scores") if isinstance(profile.get("latest_scores"), dict) else {}
+    latest_severity = profile.get("latest_severity") if isinstance(profile.get("latest_severity"), dict) else {}
+    screening_trends = profile.get("screening_trends") if isinstance(profile.get("screening_trends"), dict) else {}
+
+    rows: List[Dict[str, Any]] = []
+    for name, score in latest_scores.items():
+        rows.append(
+            {
+                "type": str(name),
+                "score": int(score or 0),
+                "severity": str(latest_severity.get(name) or "unknown"),
+                "trend": str(screening_trends.get(name) or "insufficient_data"),
+            }
+        )
+    return rows
+
+
+def build_clinician_handoff_report(
+    username: str,
+    overview: Dict[str, Any],
+    cbt_progress: Dict[str, Any],
+    recent_cbt_records: List[Dict[str, Any]],
+    checkin_summary: Dict[str, Any],
+    relapse_forecast: Dict[str, Any],
+) -> Dict[str, Any]:
+    profile = overview.get("profile") if isinstance(overview.get("profile"), dict) else {}
+    clinical = overview.get("clinical_parameters") if isinstance(overview.get("clinical_parameters"), dict) else {}
+    summary_text = str(overview.get("summary") or "").strip()
+
+    screening_rows = _screening_rows(profile)
+    risk_level = str(profile.get("risk_level") or clinical.get("risk_level") or "stable")
+    risk_score = int(profile.get("risk_score", clinical.get("risk_score", 0)) or 0)
+    relapse_probability = int(relapse_forecast.get("relapse_probability_pct") or 0)
+    relapse_band = str(relapse_forecast.get("band") or "low")
+
+    top_distortions = [
+        str(row.get("distortion") or "").replace("_", " ").strip()
+        for row in (cbt_progress.get("top_distortions") or [])
+        if str(row.get("distortion") or "").strip()
+    ]
+    top_distortions = [item for item in top_distortions if item]
+
+    cbt_snapshot = {
+        "records_last_window": int(cbt_progress.get("total_records") or 0),
+        "trend": str(cbt_progress.get("trend") or "insufficient_data"),
+        "improvement_pct": float(cbt_progress.get("improvement_pct") or 0.0),
+        "completion_rate": float(cbt_progress.get("completion_rate") or 0.0),
+        "streak_days": int(cbt_progress.get("streak_days") or 0),
+        "top_distortions": top_distortions[:5],
+    }
+
+    adherence_snapshot = {
+        "checkin_count": int(checkin_summary.get("count") or 0),
+        "avg_mood": float(checkin_summary.get("avg_mood") or 0.0),
+        "avg_stress": float(checkin_summary.get("avg_stress") or 0.0),
+        "avg_energy": float(checkin_summary.get("avg_energy") or 0.0),
+        "avg_sleep_hours": float(checkin_summary.get("avg_sleep_hours") or 0.0),
+    }
+
+    handoff_priorities: List[str] = []
+    if relapse_band in {"critical", "high"}:
+        handoff_priorities.append("Immediate review of safety status and escalation thresholds.")
+    if str(profile.get("overall_trend") or "") == "worsening":
+        handoff_priorities.append("Prioritize worsening screening trajectory in next encounter.")
+    if cbt_snapshot["completion_rate"] < 60.0:
+        handoff_priorities.append("Coach completion quality for thought records (balanced thought + action plan).")
+    if adherence_snapshot["avg_sleep_hours"] and adherence_snapshot["avg_sleep_hours"] < 6.0:
+        handoff_priorities.append("Target sleep stabilization as a high-yield relapse prevention lever.")
+    if not handoff_priorities:
+        handoff_priorities.append("Maintain current prevention strategy and monitor for early warning shifts.")
+
+    next_7_day_plan = (relapse_forecast.get("preventive_actions") or [])[:6]
+    escalation_criteria = [
+        "Rapid escalation in hopelessness or self-harm ideation language.",
+        "Marked increase in screening severity or relapse probability into critical range.",
+        "Sustained sleep collapse (<5h) with rising stress and reduced functioning.",
+        "Inability to maintain basic safety plan commitments.",
+    ]
+
+    summary_bullets = [
+        line.replace("-", "", 1).strip()
+        for line in summary_text.splitlines()
+        if line.strip()
+    ]
+    if not summary_bullets and summary_text:
+        summary_bullets = [seg.strip() for seg in re.split(r"(?<=[.!?])\s+", summary_text) if seg.strip()]
+    summary_bullets = summary_bullets[:6]
+
+    markdown_lines = [
+        f"# Clinical Handoff: {username}",
+        "",
+        f"Generated: {datetime.utcnow().isoformat()}",
+        f"Current risk level: {risk_level} (score {risk_score})",
+        f"Relapse forecast: {relapse_probability}% ({relapse_band})",
+        "",
+        "## Summary",
+    ]
+    if summary_bullets:
+        markdown_lines.extend([f"- {line}" for line in summary_bullets])
+    else:
+        markdown_lines.append("- No summary available.")
+
+    markdown_lines.extend([
+        "",
+        "## Screening Snapshot",
+    ])
+    if screening_rows:
+        for row in screening_rows:
+            markdown_lines.append(
+                f"- {row['type']}: score {row['score']} ({row['severity']}), trend {row['trend']}"
+            )
+    else:
+        markdown_lines.append("- No recent screening data.")
+
+    markdown_lines.extend([
+        "",
+        "## CBT Snapshot",
+        f"- Records in window: {cbt_snapshot['records_last_window']}",
+        f"- Trend: {cbt_snapshot['trend']}",
+        f"- Improvement: {cbt_snapshot['improvement_pct']}%",
+        f"- Completion quality: {cbt_snapshot['completion_rate']}%",
+        f"- Streak: {cbt_snapshot['streak_days']} day(s)",
+    ])
+    if cbt_snapshot["top_distortions"]:
+        markdown_lines.append(f"- Top distortions: {', '.join(cbt_snapshot['top_distortions'])}")
+
+    markdown_lines.extend([
+        "",
+        "## Handoff Priorities",
+    ])
+    markdown_lines.extend([f"- {item}" for item in handoff_priorities])
+
+    markdown_lines.extend([
+        "",
+        "## Next 7-Day Plan",
+    ])
+    markdown_lines.extend([f"- {item}" for item in next_7_day_plan])
+
+    markdown_lines.extend([
+        "",
+        "## Escalation Criteria",
+    ])
+    markdown_lines.extend([f"- {item}" for item in escalation_criteria])
+
+    return {
+        "generated_at": datetime.utcnow().isoformat(),
+        "username": username,
+        "triage": {
+            "risk_level": risk_level,
+            "risk_score": risk_score,
+            "relapse_probability_pct": relapse_probability,
+            "relapse_band": relapse_band,
+        },
+        "summary_bullets": summary_bullets,
+        "screening_snapshot": screening_rows,
+        "cbt_snapshot": cbt_snapshot,
+        "adherence_snapshot": adherence_snapshot,
+        "warning_signs": relapse_forecast.get("warning_signs") or [],
+        "protective_signals": relapse_forecast.get("protective_signals") or [],
+        "handoff_priorities": handoff_priorities,
+        "next_7_day_plan": next_7_day_plan,
+        "escalation_criteria": escalation_criteria,
+        "recent_cbt_records": recent_cbt_records[:5],
+        "report_markdown": "\n".join(markdown_lines),
+    }
