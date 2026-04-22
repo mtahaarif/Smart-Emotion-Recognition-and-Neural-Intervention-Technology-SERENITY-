@@ -7,7 +7,7 @@ import sys
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
 
-url = "http://16.171.3.197:8000/chat"
+url = "http://51.21.162.77:8000/chat"
 
 def hard_clean(text: str) -> str:
     # Fix glued words/sentences like "you.It" -> "you. It"

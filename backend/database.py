@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import create_engine, event
@@ -29,6 +29,28 @@ def _set_sqlite_pragmas(dbapi_connection, _connection_record) -> None:
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+
+def apply_schema_migrations() -> None:
+    """Apply additive SQLite migrations for existing local databases."""
+    with engine.begin() as conn:
+        users_exists = conn.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='users'"
+        ).fetchone()
+        if not users_exists:
+            return
+
+        cols = {
+            row[1]
+            for row in conn.exec_driver_sql("PRAGMA table_info(users)").fetchall()
+        }
+
+        if "requires_safety_review" not in cols:
+            conn.exec_driver_sql("ALTER TABLE users ADD COLUMN requires_safety_review INTEGER DEFAULT 0")
+        if "emergency_contact_name" not in cols:
+            conn.exec_driver_sql("ALTER TABLE users ADD COLUMN emergency_contact_name TEXT DEFAULT ''")
+        if "emergency_contact_phone" not in cols:
+            conn.exec_driver_sql("ALTER TABLE users ADD COLUMN emergency_contact_phone TEXT DEFAULT ''")
+
 def _get_models():
     """Lazy load models centrally to completely avoid try/except import overhead."""
     from backend import models
@@ -46,6 +68,65 @@ def _get_or_create_user(db, username: str, models):
         db.add(user)
         db.flush() # Flush to assign an ID without committing the full transaction yet
     return user
+
+
+def fetch_or_create_clinical_state(db, username: str) -> Dict[str, Any]:
+    models = _get_models()
+    user = _get_or_create_user(db, username, models)
+    state = db.query(models.ClinicalState).filter(models.ClinicalState.user_id == user.id).first()
+    if not state:
+        state = models.ClinicalState(user_id=user.id)
+        db.add(state)
+        db.commit()
+        db.refresh(state)
+
+    return {
+        "id": state.id,
+        "user_id": user.id,
+        "username": user.username,
+        "active_framework": state.active_framework,
+        "current_phase": state.current_phase,
+        "phase_index": state.phase_index,
+        "requires_safety_review": bool(state.requires_safety_review),
+        "last_risk_score": int(state.last_risk_score or 0),
+        "last_route_reason": state.last_route_reason or "",
+        "last_detected_distortion": state.last_detected_distortion or "",
+        "last_distress_level": state.last_distress_level or "",
+        "updated_at": state.updated_at.isoformat() if state.updated_at else None,
+        "emergency_contact_name": user.emergency_contact_name or "",
+        "emergency_contact_phone": user.emergency_contact_phone or "",
+    }
+
+
+def upsert_clinical_state(db, username: str, updates: Dict[str, Any]) -> Dict[str, Any]:
+    models = _get_models()
+    user = _get_or_create_user(db, username, models)
+    state = db.query(models.ClinicalState).filter(models.ClinicalState.user_id == user.id).first()
+    if not state:
+        state = models.ClinicalState(user_id=user.id)
+        db.add(state)
+
+    for key, value in (updates or {}).items():
+        if hasattr(state, key):
+            setattr(state, key, value)
+
+    state.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(state)
+    return fetch_or_create_clinical_state(db, username)
+
+
+def update_user_emergency_contact(db, username: str, contact_name: str, contact_phone: str) -> Dict[str, str]:
+    models = _get_models()
+    user = _get_or_create_user(db, username, models)
+    user.emergency_contact_name = _clamp_text(contact_name or "", 128)
+    user.emergency_contact_phone = _clamp_text(contact_phone or "", 64)
+    db.commit()
+    return {
+        "username": user.username,
+        "emergency_contact_name": user.emergency_contact_name or "",
+        "emergency_contact_phone": user.emergency_contact_phone or "",
+    }
 
 def fetch_recent_turns(db, username: str, limit: int = 6):
     models = _get_models()
@@ -76,6 +157,207 @@ def persist_turn(db, username: str, user_text: str, assistant_text: str, dominan
     db.commit()
     # Removed db.refresh() to save a redundant SELECT query
     return turn
+
+
+def persist_clinical_routing_event(
+    db,
+    username: str,
+    routed_framework: str,
+    route_reason: str,
+    risk_score: int,
+    route_locked: bool,
+    acute_safety_trigger: bool,
+    rumination_detected: bool,
+    detected_distortion: str,
+    dominant_emotion: str,
+    speech_emotion: str,
+    face_emotion: str,
+    turn_id: Optional[int] = None,
+):
+    models = _get_models()
+    user = _get_or_create_user(db, username, models)
+    event_row = models.ClinicalRoutingEvent(
+        user_id=user.id,
+        turn_id=turn_id,
+        routed_framework=_clamp_text(routed_framework, 64),
+        route_reason=_clamp_text(route_reason, 300),
+        risk_score=int(risk_score or 0),
+        route_locked=bool(route_locked),
+        acute_safety_trigger=bool(acute_safety_trigger),
+        rumination_detected=bool(rumination_detected),
+        detected_distortion=_clamp_text(detected_distortion or "", 64),
+        dominant_emotion=_clamp_text(dominant_emotion or "neutral", 32),
+        speech_emotion=_clamp_text(speech_emotion or "neutral", 32),
+        face_emotion=_clamp_text(face_emotion or "neutral", 32),
+    )
+    db.add(event_row)
+    db.commit()
+    return event_row
+
+
+def persist_clinical_distortion_event(
+    db,
+    username: str,
+    distortion_label: str,
+    framework: str,
+    source_excerpt: str,
+    turn_id: Optional[int] = None,
+):
+    models = _get_models()
+    user = _get_or_create_user(db, username, models)
+    row = models.ClinicalDistortionEvent(
+        user_id=user.id,
+        turn_id=turn_id,
+        distortion_label=_clamp_text(distortion_label, 64),
+        framework=_clamp_text(framework, 64),
+        source_excerpt=_clamp_text(source_excerpt, 2000),
+    )
+    db.add(row)
+    db.commit()
+    return row
+
+
+def persist_safety_escalation_event(
+    db,
+    username: str,
+    trigger_type: str,
+    risk_score: int,
+    dominant_emotion: str,
+    transcript_excerpt: str,
+    handoff_markdown: str,
+    turn_id: Optional[int] = None,
+):
+    models = _get_models()
+    user = _get_or_create_user(db, username, models)
+    row = models.SafetyEscalationEvent(
+        user_id=user.id,
+        turn_id=turn_id,
+        trigger_type=_clamp_text(trigger_type, 128),
+        risk_score=int(risk_score or 0),
+        dominant_emotion=_clamp_text(dominant_emotion or "neutral", 32),
+        transcript_excerpt=_clamp_text(transcript_excerpt, 4000),
+        handoff_markdown=_clamp_text(handoff_markdown, 20000),
+    )
+    db.add(row)
+    db.commit()
+    return row
+
+
+def replace_trajectory_snapshots(db, username: str, snapshots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    models = _get_models()
+    user = _get_or_create_user(db, username, models)
+
+    db.query(models.TrajectorySnapshot).filter(models.TrajectorySnapshot.user_id == user.id).delete()
+    db.flush()
+
+    rows: List[Any] = []
+    for snapshot in snapshots or []:
+        computed = snapshot.get("computed_at")
+        try:
+            computed_at = datetime.fromisoformat(str(computed).replace("Z", "+00:00")).replace(tzinfo=None)
+        except Exception:
+            computed_at = datetime.utcnow()
+
+        row = models.TrajectorySnapshot(
+            user_id=user.id,
+            questionnaire_type=_clamp_text(snapshot.get("questionnaire_type") or "", 16),
+            baseline_score=int(snapshot.get("baseline_score") or 0),
+            latest_score=int(snapshot.get("latest_score") or 0),
+            delta_score=int(snapshot.get("delta_score") or 0),
+            window_days=int(snapshot.get("window_days") or 7),
+            flagged=bool(snapshot.get("flagged", False)),
+            computed_at=computed_at,
+        )
+        rows.append(row)
+        db.add(row)
+
+    db.commit()
+    return fetch_trajectory_snapshots(db, username)
+
+
+def fetch_trajectory_snapshots(db, username: str) -> List[Dict[str, Any]]:
+    models = _get_models()
+    query = (
+        db.query(models.TrajectorySnapshot, models.User.username)
+        .join(models.User, models.TrajectorySnapshot.user_id == models.User.id)
+        .filter(models.User.username == username)
+        .order_by(models.TrajectorySnapshot.questionnaire_type.asc())
+    )
+
+    rows = query.all()
+    return [
+        {
+            "id": row.id,
+            "username": row_username,
+            "questionnaire_type": row.questionnaire_type,
+            "baseline_score": int(row.baseline_score or 0),
+            "latest_score": int(row.latest_score or 0),
+            "delta_score": int(row.delta_score or 0),
+            "window_days": int(row.window_days or 7),
+            "flagged": bool(row.flagged),
+            "computed_at": row.computed_at.isoformat() if row.computed_at else None,
+        }
+        for row, row_username in rows
+    ]
+
+
+def persist_edge_diagnostic_sample(db, username: Optional[str], sample: Dict[str, Any]) -> Dict[str, Any]:
+    models = _get_models()
+    user = None
+    if username:
+        user = _get_or_create_user(db, username, models)
+
+    row = models.EdgeDiagnosticSample(
+        user_id=user.id if user else None,
+        source=_clamp_text(sample.get("source") or "voice", 32),
+        stt_latency_ms=float(sample.get("stt_latency_ms") or 0.0),
+        ser_latency_ms=float(sample.get("ser_latency_ms") or 0.0),
+        fer_latency_ms=float(sample.get("fer_latency_ms") or 0.0),
+        total_latency_ms=float(sample.get("total_latency_ms") or 0.0),
+        memory_mb=float(sample.get("memory_mb") or 0.0),
+        speech_confidence=float(sample.get("speech_confidence") or 0.0),
+        face_confidence=float(sample.get("face_confidence") or 0.0),
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return {
+        "id": row.id,
+        "username": username,
+        "source": row.source,
+        "stt_latency_ms": row.stt_latency_ms,
+        "ser_latency_ms": row.ser_latency_ms,
+        "fer_latency_ms": row.fer_latency_ms,
+        "total_latency_ms": row.total_latency_ms,
+        "memory_mb": row.memory_mb,
+        "speech_confidence": row.speech_confidence,
+        "face_confidence": row.face_confidence,
+        "timestamp": row.timestamp.isoformat() if row.timestamp else None,
+    }
+
+
+def fetch_recent_edge_diagnostics(db, username: Optional[str], limit: int = 120) -> List[Dict[str, Any]]:
+    models = _get_models()
+    query = db.query(models.EdgeDiagnosticSample)
+    if username:
+        query = query.join(models.User, models.EdgeDiagnosticSample.user_id == models.User.id).filter(models.User.username == username)
+
+    rows = query.order_by(models.EdgeDiagnosticSample.timestamp.desc()).limit(max(1, int(limit))).all()
+    return [
+        {
+            "id": row.id,
+            "source": row.source,
+            "stt_latency_ms": float(row.stt_latency_ms or 0.0),
+            "ser_latency_ms": float(row.ser_latency_ms or 0.0),
+            "fer_latency_ms": float(row.fer_latency_ms or 0.0),
+            "total_latency_ms": float(row.total_latency_ms or 0.0),
+            "memory_mb": float(row.memory_mb or 0.0),
+            "speech_confidence": float(row.speech_confidence or 0.0),
+            "face_confidence": float(row.face_confidence or 0.0),
+            "timestamp": row.timestamp.isoformat() if row.timestamp else None,
+        }
+        for row in rows
+    ]
 
 def persist_questionnaire_result(db, username: str, questionnaire_type: str, answers: List[int], total_score: int, severity: str, created_at: Optional[datetime] = None):
     models = _get_models()
@@ -123,6 +405,136 @@ def fetch_questionnaire_results(db, username: Optional[str] = None, questionnair
         results.append(payload)
     return results
 
+
+def calculate_symptom_trajectory(db, user_id: int) -> Dict[str, Any]:
+    """Build 3-point questionnaire trajectories and enforce velocity-based safety flagging."""
+    models = _get_models()
+
+    try:
+        normalized_user_id = int(user_id)
+    except (TypeError, ValueError):
+        return {
+            "user_id": None,
+            "requires_safety_review": False,
+            "history": {"PHQ-9": [], "GAD-7": [], "PCL-5": []},
+            "velocity_delta": {"PHQ-9": None, "GAD-7": None},
+            "time_series": [],
+            "latest_scores": {},
+        }
+
+    user = db.query(models.User).filter(models.User.id == normalized_user_id).first()
+    if not user:
+        return {
+            "user_id": normalized_user_id,
+            "requires_safety_review": False,
+            "history": {"PHQ-9": [], "GAD-7": [], "PCL-5": []},
+            "velocity_delta": {"PHQ-9": None, "GAD-7": None},
+            "time_series": [],
+            "latest_scores": {},
+        }
+
+    tracked_types = ("PHQ-9", "GAD-7", "PCL-5")
+    history: Dict[str, List[Dict[str, Any]]] = {key: [] for key in tracked_types}
+
+    for questionnaire_type in tracked_types:
+        rows = (
+            db.query(models.QuestionnaireResult)
+            .filter(
+                models.QuestionnaireResult.user_id == user.id,
+                models.QuestionnaireResult.questionnaire_type == questionnaire_type,
+            )
+            .order_by(models.QuestionnaireResult.created_at.desc())
+            .limit(3)
+            .all()
+        )
+
+        # Convert to ascending time order for charting and delta computations.
+        normalized_rows = list(reversed(rows))
+        history[questionnaire_type] = [
+            {
+                "id": row.id,
+                "score": int(row.total_score or 0),
+                "severity": str(row.severity or "unknown"),
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+            }
+            for row in normalized_rows
+        ]
+
+    velocity_delta: Dict[str, Optional[int]] = {"PHQ-9": None, "GAD-7": None}
+    velocity_trigger = False
+    for questionnaire_type in ("PHQ-9", "GAD-7"):
+        series = history.get(questionnaire_type) or []
+        if len(series) >= 2:
+            delta = int(series[-1].get("score") or 0) - int(series[-2].get("score") or 0)
+            velocity_delta[questionnaire_type] = delta
+            if delta >= 5:
+                velocity_trigger = True
+
+    if velocity_trigger and not bool(getattr(user, "requires_safety_review", False)):
+        user.requires_safety_review = True
+        state = db.query(models.ClinicalState).filter(models.ClinicalState.user_id == user.id).first()
+        if state and not bool(getattr(state, "requires_safety_review", False)):
+            state.requires_safety_review = True
+            state.updated_at = datetime.utcnow()
+        db.commit()
+
+    def _series_key(questionnaire_type: str) -> str:
+        if questionnaire_type == "PHQ-9":
+            return "phq9"
+        if questionnaire_type == "GAD-7":
+            return "gad7"
+        return "pcl5"
+
+    def _display_date(timestamp_value: Optional[str]) -> str:
+        if not timestamp_value:
+            return "Unknown"
+        try:
+            parsed = datetime.fromisoformat(str(timestamp_value).replace("Z", "+00:00"))
+            return parsed.strftime("%Y-%m-%d")
+        except ValueError:
+            return str(timestamp_value)
+
+    timeline: Dict[str, Dict[str, Any]] = {}
+    for questionnaire_type, points in history.items():
+        data_key = _series_key(questionnaire_type)
+        for idx, point in enumerate(points):
+            timestamp = point.get("created_at") or f"{questionnaire_type}:{idx}"
+            bucket = timeline.get(timestamp)
+            if not bucket:
+                bucket = {
+                    "timestamp": timestamp,
+                    "date": _display_date(str(timestamp) if isinstance(timestamp, str) else None),
+                    "phq9": None,
+                    "gad7": None,
+                    "pcl5": None,
+                }
+                timeline[timestamp] = bucket
+            bucket[data_key] = int(point.get("score") or 0)
+
+    def _timeline_sort_key(item: Dict[str, Any]) -> datetime:
+        raw = str(item.get("timestamp") or "")
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return datetime.min
+
+    sorted_series = sorted(timeline.values(), key=_timeline_sort_key)
+
+    latest_scores = {
+        questionnaire_type: int(points[-1].get("score") or 0)
+        for questionnaire_type, points in history.items()
+        if points
+    }
+
+    return {
+        "user_id": user.id,
+        "requires_safety_review": bool(getattr(user, "requires_safety_review", False)),
+        "history": history,
+        "velocity_delta": velocity_delta,
+        "time_series": sorted_series,
+        "latest_scores": latest_scores,
+    }
+
 def fetch_recent_turn_summaries(db, limit: int = 200, text_limit: Optional[int] = None, username: Optional[str] = None) -> List[Dict[str, Any]]:
     models = _get_models()
     query = (
@@ -169,251 +581,3 @@ def fetch_recent_sessions_with_emotions(db, limit: int = 100, conversation_limit
             "timestamp": e.timestamp.isoformat() if e.timestamp else None
         } for e in sorted(session.emotions, key=lambda val: val.timestamp or datetime.min)]
     } for session in sessions]
-
-
-def persist_care_plan_checkin(
-    db,
-    username: str,
-    mood_rating: int,
-    stress_rating: int,
-    energy_rating: int,
-    sleep_hours: float,
-    completed_targets: Optional[List[str]] = None,
-    note: str = "",
-):
-    models = _get_models()
-    user = _get_or_create_user(db, username, models)
-
-    normalized_targets = [
-        _clamp_text(str(item), 128)
-        for item in (completed_targets or [])
-        if str(item).strip()
-    ]
-
-    checkin = models.CarePlanCheckin(
-        user_id=user.id,
-        mood_rating=max(1, min(10, int(mood_rating))),
-        stress_rating=max(1, min(10, int(stress_rating))),
-        energy_rating=max(1, min(10, int(energy_rating))),
-        sleep_hours=max(0.0, min(24.0, float(sleep_hours))),
-        completed_targets_json=json.dumps(normalized_targets, separators=(",", ":")),
-        note=_clamp_text(note, 800),
-    )
-    db.add(checkin)
-    db.commit()
-    db.refresh(checkin)
-    return checkin
-
-
-def fetch_care_plan_checkins(db, username: str, limit: int = 30) -> List[Dict[str, Any]]:
-    models = _get_models()
-    rows = (
-        db.query(models.CarePlanCheckin)
-        .join(models.User, models.CarePlanCheckin.user_id == models.User.id)
-        .filter(models.User.username == username)
-        .order_by(models.CarePlanCheckin.created_at.desc())
-        .limit(max(1, limit))
-        .all()
-    )
-
-    results: List[Dict[str, Any]] = []
-    for row in rows:
-        try:
-            completed_targets = json.loads(row.completed_targets_json or "[]")
-            if not isinstance(completed_targets, list):
-                completed_targets = []
-        except json.JSONDecodeError:
-            completed_targets = []
-
-        results.append(
-            {
-                "id": row.id,
-                "mood_rating": int(row.mood_rating or 5),
-                "stress_rating": int(row.stress_rating or 5),
-                "energy_rating": int(row.energy_rating or 5),
-                "sleep_hours": float(row.sleep_hours or 0.0),
-                "completed_targets": [str(item) for item in completed_targets],
-                "note": row.note or "",
-                "created_at": row.created_at.isoformat() if row.created_at else None,
-            }
-        )
-    return results
-
-
-def persist_cbt_thought_record(
-    db,
-    username: str,
-    situation: str,
-    automatic_thought: str,
-    emotion_label: str,
-    intensity_before: int,
-    cognitive_distortions: Optional[List[str]] = None,
-    evidence_for: str = "",
-    evidence_against: str = "",
-    balanced_thought: str = "",
-    intensity_after: int = 5,
-    action_plan: str = "",
-    created_at: Optional[datetime] = None,
-):
-    models = _get_models()
-    user = _get_or_create_user(db, username, models)
-
-    normalized_distortions = [
-        _clamp_text(str(item), 64)
-        for item in (cognitive_distortions or [])
-        if str(item).strip()
-    ]
-
-    record = models.CBTThoughtRecord(
-        user_id=user.id,
-        situation=_clamp_text(situation, 1000),
-        automatic_thought=_clamp_text(automatic_thought, 1000),
-        emotion_label=_clamp_text(emotion_label, 64),
-        intensity_before=max(0, min(10, int(intensity_before))),
-        cognitive_distortions_json=json.dumps(normalized_distortions, separators=(",", ":")),
-        evidence_for=_clamp_text(evidence_for, 1000),
-        evidence_against=_clamp_text(evidence_against, 1000),
-        balanced_thought=_clamp_text(balanced_thought, 1000),
-        intensity_after=max(0, min(10, int(intensity_after))),
-        action_plan=_clamp_text(action_plan, 1000),
-        created_at=created_at or datetime.utcnow(),
-    )
-    db.add(record)
-    db.commit()
-    db.refresh(record)
-    return record
-
-
-def fetch_cbt_thought_records(db, username: str, limit: int = 50) -> List[Dict[str, Any]]:
-    models = _get_models()
-    rows = (
-        db.query(models.CBTThoughtRecord)
-        .join(models.User, models.CBTThoughtRecord.user_id == models.User.id)
-        .filter(models.User.username == username)
-        .order_by(models.CBTThoughtRecord.created_at.desc())
-        .limit(max(1, limit))
-        .all()
-    )
-
-    payload: List[Dict[str, Any]] = []
-    for row in rows:
-        try:
-            distortions = json.loads(row.cognitive_distortions_json or "[]")
-            if not isinstance(distortions, list):
-                distortions = []
-        except json.JSONDecodeError:
-            distortions = []
-
-        payload.append(
-            {
-                "id": row.id,
-                "situation": row.situation or "",
-                "automatic_thought": row.automatic_thought or "",
-                "emotion_label": row.emotion_label or "",
-                "intensity_before": int(row.intensity_before or 0),
-                "cognitive_distortions": [str(item) for item in distortions],
-                "evidence_for": row.evidence_for or "",
-                "evidence_against": row.evidence_against or "",
-                "balanced_thought": row.balanced_thought or "",
-                "intensity_after": int(row.intensity_after or 0),
-                "action_plan": row.action_plan or "",
-                "created_at": row.created_at.isoformat() if row.created_at else None,
-            }
-        )
-    return payload
-
-
-def fetch_cbt_weekly_progress(db, username: str, days: int = 7) -> Dict[str, Any]:
-    models = _get_models()
-    window_days = max(1, min(int(days or 7), 30))
-    cutoff = datetime.utcnow() - timedelta(days=window_days)
-
-    rows = (
-        db.query(models.CBTThoughtRecord)
-        .join(models.User, models.CBTThoughtRecord.user_id == models.User.id)
-        .filter(models.User.username == username)
-        .filter(models.CBTThoughtRecord.created_at >= cutoff)
-        .order_by(models.CBTThoughtRecord.created_at.desc())
-        .all()
-    )
-
-    if not rows:
-        return {
-            "window_days": window_days,
-            "total_records": 0,
-            "avg_intensity_before": 0.0,
-            "avg_intensity_after": 0.0,
-            "avg_intensity_reduction": 0.0,
-            "improvement_pct": 0.0,
-            "completion_rate": 0.0,
-            "streak_days": 0,
-            "top_distortions": [],
-            "trend": "insufficient_data",
-        }
-
-    total = len(rows)
-    before_values = [int(row.intensity_before or 0) for row in rows]
-    after_values = [int(row.intensity_after or 0) for row in rows]
-    avg_before = round(sum(before_values) / max(1, total), 2)
-    avg_after = round(sum(after_values) / max(1, total), 2)
-    reduction = round(avg_before - avg_after, 2)
-    improvement_pct = round((reduction / avg_before) * 100.0, 2) if avg_before > 0 else 0.0
-
-    complete_count = 0
-    distortion_counts: Dict[str, int] = {}
-    days_with_records = set()
-
-    for row in rows:
-        if str(row.balanced_thought or "").strip() and str(row.action_plan or "").strip():
-            complete_count += 1
-        if row.created_at:
-            days_with_records.add(row.created_at.date())
-
-        try:
-            distortions = json.loads(row.cognitive_distortions_json or "[]")
-            if not isinstance(distortions, list):
-                distortions = []
-        except json.JSONDecodeError:
-            distortions = []
-
-        for distortion in distortions:
-            key = str(distortion).strip().lower()
-            if key:
-                distortion_counts[key] = distortion_counts.get(key, 0) + 1
-
-    completion_rate = round((complete_count / max(1, total)) * 100.0, 2)
-
-    today = datetime.utcnow().date()
-    streak = 0
-    for i in range(window_days):
-        day = today - timedelta(days=i)
-        if day in days_with_records:
-            streak += 1
-        else:
-            break
-
-    ranked_distortions = sorted(
-        [{"distortion": key, "count": count} for key, count in distortion_counts.items()],
-        key=lambda item: item["count"],
-        reverse=True,
-    )
-
-    if reduction >= 1.0 and improvement_pct >= 10.0:
-        trend = "improving"
-    elif reduction <= -0.5:
-        trend = "worsening"
-    else:
-        trend = "stable"
-
-    return {
-        "window_days": window_days,
-        "total_records": total,
-        "avg_intensity_before": avg_before,
-        "avg_intensity_after": avg_after,
-        "avg_intensity_reduction": reduction,
-        "improvement_pct": improvement_pct,
-        "completion_rate": completion_rate,
-        "streak_days": streak,
-        "top_distortions": ranked_distortions[:6],
-        "trend": trend,
-    }

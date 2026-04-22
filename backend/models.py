@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, Text
+from sqlalchemy import Boolean, Column, Integer, String, Float, ForeignKey, DateTime, Text
 from sqlalchemy.orm import relationship
 from datetime import datetime
 
@@ -7,28 +7,32 @@ try:
 except ImportError:
     from database import Base
 
+# Replace your current User class in models.py with this unified version:
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
     username = Column(String, unique=True, index=True)
     password = Column(String)
+    requires_safety_review = Column(Boolean, default=False)
+    
+    # --- NEW CLINICAL PERSISTENCE FIELDS ---
+    last_crisis_timestamp = Column(String, nullable=True) # ISO format timestamp
+    duty_to_warn = Column(Boolean, default=False) # Tarasoff Rule flag
+    latest_cssrs_risk = Column(String, default="Unassessed") # Low, Moderate, High
+    
+    emergency_contact_name = Column(String, default="")
+    emergency_contact_phone = Column(String, default="")
+    
+    # Relationships
     sessions = relationship("Session", back_populates="user")
     turns = relationship("ConversationTurn", back_populates="user", cascade="all, delete-orphan")
-    questionnaire_results = relationship(
-        "QuestionnaireResult",
-        back_populates="user",
-        cascade="all, delete-orphan",
-    )
-    care_plan_checkins = relationship(
-        "CarePlanCheckin",
-        back_populates="user",
-        cascade="all, delete-orphan",
-    )
-    cbt_thought_records = relationship(
-        "CBTThoughtRecord",
-        back_populates="user",
-        cascade="all, delete-orphan",
-    )
+    questionnaire_results = relationship("QuestionnaireResult", back_populates="user", cascade="all, delete-orphan")
+    clinical_state = relationship("ClinicalState", back_populates="user", uselist=False, cascade="all, delete-orphan")
+    routing_events = relationship("ClinicalRoutingEvent", back_populates="user", cascade="all, delete-orphan")
+    distortion_events = relationship("ClinicalDistortionEvent", back_populates="user", cascade="all, delete-orphan")
+    safety_escalations = relationship("SafetyEscalationEvent", back_populates="user", cascade="all, delete-orphan")
+    trajectory_snapshots = relationship("TrajectorySnapshot", back_populates="user", cascade="all, delete-orphan")
+    diagnostics_samples = relationship("EdgeDiagnosticSample", back_populates="user", cascade="all, delete-orphan")
 
 class Session(Base):
     __tablename__ = "sessions"
@@ -78,37 +82,104 @@ class QuestionnaireResult(Base):
     user = relationship("User", back_populates="questionnaire_results")
 
 
-class CarePlanCheckin(Base):
-    __tablename__ = "care_plan_checkins"
+class ClinicalState(Base):
+    __tablename__ = "clinical_states"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True, index=True)
+    active_framework = Column(String, default="Supportive_Stabilization", index=True)
+    current_phase = Column(String, default="Emotional Check-In")
+    phase_index = Column(Integer, default=0)
+    requires_safety_review = Column(Boolean, default=False)
+    last_risk_score = Column(Integer, default=0)
+    last_route_reason = Column(String, default="")
+    last_detected_distortion = Column(String, default="")
+    last_distress_level = Column(String, default="")
+    updated_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    user = relationship("User", back_populates="clinical_state")
+
+
+class ClinicalRoutingEvent(Base):
+    __tablename__ = "clinical_routing_events"
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    mood_rating = Column(Integer, nullable=False, default=5)
-    stress_rating = Column(Integer, nullable=False, default=5)
-    energy_rating = Column(Integer, nullable=False, default=5)
-    sleep_hours = Column(Float, nullable=False, default=7.0)
-    completed_targets_json = Column(Text, nullable=False, default="[]")
-    note = Column(Text, nullable=False, default="")
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    turn_id = Column(Integer, ForeignKey("conversation_turns.id"), nullable=True, index=True)
+    routed_framework = Column(String, nullable=False, index=True)
+    route_reason = Column(String, default="")
+    risk_score = Column(Integer, default=0)
+    route_locked = Column(Boolean, default=False)
+    acute_safety_trigger = Column(Boolean, default=False)
+    rumination_detected = Column(Boolean, default=False)
+    detected_distortion = Column(String, default="")
+    dominant_emotion = Column(String, default="neutral")
+    speech_emotion = Column(String, default="neutral")
+    face_emotion = Column(String, default="neutral")
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
 
-    user = relationship("User", back_populates="care_plan_checkins")
+    user = relationship("User", back_populates="routing_events")
 
 
-class CBTThoughtRecord(Base):
-    __tablename__ = "cbt_thought_records"
+class ClinicalDistortionEvent(Base):
+    __tablename__ = "clinical_distortion_events"
 
     id = Column(Integer, primary_key=True, index=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
-    situation = Column(Text, nullable=False, default="")
-    automatic_thought = Column(Text, nullable=False, default="")
-    emotion_label = Column(String, nullable=False, default="")
-    intensity_before = Column(Integer, nullable=False, default=5)
-    cognitive_distortions_json = Column(Text, nullable=False, default="[]")
-    evidence_for = Column(Text, nullable=False, default="")
-    evidence_against = Column(Text, nullable=False, default="")
-    balanced_thought = Column(Text, nullable=False, default="")
-    intensity_after = Column(Integer, nullable=False, default=5)
-    action_plan = Column(Text, nullable=False, default="")
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+    turn_id = Column(Integer, ForeignKey("conversation_turns.id"), nullable=True, index=True)
+    distortion_label = Column(String, nullable=False, index=True)
+    framework = Column(String, default="Supportive_Stabilization")
+    source_excerpt = Column(Text, default="")
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
 
-    user = relationship("User", back_populates="cbt_thought_records")
+    user = relationship("User", back_populates="distortion_events")
+
+
+class SafetyEscalationEvent(Base):
+    __tablename__ = "safety_escalation_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    turn_id = Column(Integer, ForeignKey("conversation_turns.id"), nullable=True, index=True)
+    trigger_type = Column(String, default="")
+    risk_score = Column(Integer, default=0)
+    dominant_emotion = Column(String, default="neutral")
+    transcript_excerpt = Column(Text, default="")
+    handoff_markdown = Column(Text, default="")
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+
+    user = relationship("User", back_populates="safety_escalations")
+
+
+class TrajectorySnapshot(Base):
+    __tablename__ = "trajectory_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    questionnaire_type = Column(String, nullable=False, index=True)
+    baseline_score = Column(Integer, default=0)
+    latest_score = Column(Integer, default=0)
+    delta_score = Column(Integer, default=0)
+    window_days = Column(Integer, default=7)
+    flagged = Column(Boolean, default=False)
+    computed_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    user = relationship("User", back_populates="trajectory_snapshots")
+
+
+class EdgeDiagnosticSample(Base):
+    __tablename__ = "edge_diagnostic_samples"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    source = Column(String, default="voice")
+    stt_latency_ms = Column(Float, default=0.0)
+    ser_latency_ms = Column(Float, default=0.0)
+    fer_latency_ms = Column(Float, default=0.0)
+    total_latency_ms = Column(Float, default=0.0)
+    memory_mb = Column(Float, default=0.0)
+    speech_confidence = Column(Float, default=0.0)
+    face_confidence = Column(Float, default=0.0)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+
+    user = relationship("User", back_populates="diagnostics_samples")

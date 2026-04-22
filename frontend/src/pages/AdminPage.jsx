@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import axios from 'axios';
+import ReactMarkdown from 'react-markdown';
 import {
   Activity,
   AlertTriangle,
@@ -7,12 +8,15 @@ import {
   Brain,
   Clock3,
   Database,
+  Download,
   FileText,
   Loader2,
   LogOut,
   MessageSquare,
   Shield,
   RefreshCw,
+  CheckCircle2,
+  Stethoscope,
 } from 'lucide-react';
 import { Link } from 'react-router-dom';
 
@@ -21,23 +25,26 @@ const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:5000
 const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
 
 const formatDate = (value) => {
-  if (!value) return 'Unknown time';
+  if (!value) return 'N/A';
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return String(value);
-  return parsed.toLocaleString();
+  return parsed.toLocaleString('en-US', { 
+    timeZone: 'Asia/Karachi' 
+  });
 };
 
-const riskTone = (riskLevel) => {
-  const key = String(riskLevel || '').toLowerCase();
-  if (key === 'elevated') return 'border-rose-500/60 bg-rose-950/30 text-rose-200';
-  if (key === 'monitor') return 'border-amber-500/60 bg-amber-950/30 text-amber-200';
+const acuityTone = (level) => {
+  const key = String(level || '').toLowerCase();
+  if (key === 'elevated' || key === 'high' || key === 'worsening') return 'border-rose-500/60 bg-rose-950/30 text-rose-200';
+  if (key === 'monitor' || key === 'moderate') return 'border-amber-500/60 bg-amber-950/30 text-amber-200';
   return 'border-emerald-500/60 bg-emerald-950/30 text-emerald-200';
 };
 
 const MetricIcon = ({ id }) => {
   if (id === 'turns') return <MessageSquare size={15} />;
-  if (id === 'sessions') return <Clock3 size={15} />;
+  if (id === 'care_plan_adherence') return <CheckCircle2 size={15} />;
   if (id === 'emotion_events') return <Brain size={15} />;
+  if (id === 'questionnaire_entries') return <FileText size={15} />;
   if (id === 'risk_score') return <Shield size={15} />;
   if (id === 'distress_signals') return <AlertTriangle size={15} />;
   return <Database size={15} />;
@@ -45,32 +52,27 @@ const MetricIcon = ({ id }) => {
 
 const AdminPage = ({ user, onLogout }) => {
   const [overview, setOverview] = useState(null);
-  const [isLoading, setIsLoading] = useState(true);
+  const [isClinicalReportLoading, setIsClinicalReportLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
+  const [clinicalReportError, setClinicalReportError] = useState('');
+  const [handoffError, setHandoffError] = useState('');
+  const [isExporting, setIsExporting] = useState(false);
   const [limit, setLimit] = useState(300);
   const [chatVisibleCount, setChatVisibleCount] = useState(30);
+  const [clinicalReport, setClinicalReport] = useState('');
+  const [clinicalReportSource, setClinicalReportSource] = useState('');
+  const [clinicalReportGeneratedAt, setClinicalReportGeneratedAt] = useState('');
 
-  const metrics = useMemo(() => (Array.isArray(overview?.metrics) ? overview.metrics : []), [overview]);
-  const chats = useMemo(() => (Array.isArray(overview?.chats) ? overview.chats : []), [overview]);
-  const sessions = useMemo(() => (Array.isArray(overview?.sessions) ? overview.sessions : []), [overview]);
-  const questionnaireResults = useMemo(
-    () => (Array.isArray(overview?.questionnaire_results) ? overview.questionnaire_results : []),
-    [overview]
-  );
-  const topEmotions = useMemo(() => (Array.isArray(overview?.top_emotions) ? overview.top_emotions : []), [overview]);
-  const profile = useMemo(() => (overview?.profile && typeof overview.profile === 'object' ? overview.profile : null), [overview]);
-  const clinical = useMemo(
-    () => (overview?.clinical_parameters && typeof overview.clinical_parameters === 'object' ? overview.clinical_parameters : {}),
-    [overview]
-  );
+  const metrics = useMemo(() => overview?.metrics || [], [overview]);
+  const chats = useMemo(() => overview?.chats || [], [overview]);
+  const timelineEvents = useMemo(() => overview?.timeline_events || [], [overview]);
+  const protocolFidelity = useMemo(() => overview?.protocol_fidelity || [], [overview]);
+  const questionnaireResults = useMemo(() => overview?.questionnaire_results || [], [overview]);
+  const topEmotions = useMemo(() => overview?.top_emotions || [], [overview]);
+  const profile = useMemo(() => overview?.profile || {}, [overview]);
+  const clinical = useMemo(() => overview?.clinical_parameters || {}, [overview]);
+  
   const displayedChats = useMemo(() => chats.slice(0, chatVisibleCount), [chats, chatVisibleCount]);
-
-  const summaryLines = useMemo(() => {
-    const text = String(overview?.summary || '').trim();
-    if (!text) return [];
-    const rows = text.includes('\n') ? text.split('\n') : text.split(/(?<=\.)\s+/);
-    return rows.map((line) => line.replace(/^[-•]\s*/, '').trim()).filter(Boolean).slice(0, 6);
-  }, [overview]);
 
   const scoreRows = useMemo(() => {
     if (!profile?.latest_scores) return [];
@@ -82,276 +84,301 @@ const AdminPage = ({ user, onLogout }) => {
     }));
   }, [profile]);
 
+  const targetUserId = useMemo(() => {
+    const raw = overview?.user_id ?? profile?.user_id;
+    return Number.isFinite(Number(raw)) ? Number(raw) : null;
+  }, [overview, profile]);
+
   const loadOverview = async (targetLimit = limit) => {
     const finalLimit = clamp(Number(targetLimit) || 300, 20, 3000);
     setErrorMessage('');
-    setIsLoading(true);
     setChatVisibleCount(30);
     try {
-      if (!user) {
-        throw new Error('Missing active user session.');
-      }
       const response = await axios.get(`${API_BASE_URL}/api/admin/overview`, {
         params: { limit: finalLimit, username: user },
       });
       setOverview(response.data || null);
     } catch (error) {
-      const backendMessage =
-        error.response?.data?.detail ||
-        error.response?.data?.error ||
-        'Failed to load admin overview.';
-      setErrorMessage(String(backendMessage));
+      setErrorMessage("Data synchronization failed. Check backend connectivity.");
+    }
+  };
+
+  const loadClinicalReport = async () => {
+    setClinicalReportError('');
+    setIsClinicalReportLoading(true);
+    try {
+      const response = await axios.get(`${API_BASE_URL}/api/admin/clinical-report`, {
+        params: { username: user },
+      });
+      setClinicalReport(response.data?.summary || '');
+      setClinicalReportSource(response.data?.summary_source || 'fallback');
+      setClinicalReportGeneratedAt(response.data?.generated_at || '');
+    } catch (error) {
+      setClinicalReportError("Clinical synthesis timed out. You may manually retry formulation.");
     } finally {
-      setIsLoading(false);
+      setIsClinicalReportLoading(false);
     }
   };
 
   useEffect(() => {
     loadOverview(limit);
+    loadClinicalReport();
   }, []);
 
+  const handleGlobalRefresh = () => {
+    loadOverview(limit);
+    loadClinicalReport();
+  };
+
+  const exportClinicalHandoff = async () => {
+    setHandoffError('');
+    if (!targetUserId) return;
+    setIsExporting(true);
+    try {
+      const response = await axios.get(`${API_BASE_URL}/api/admin/handoff/${targetUserId}`);
+      const blob = new Blob([response.data.markdown], { type: 'text/markdown' });
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `${user}_clinical_SBAR_handoff.md`;
+      link.click();
+    } catch (error) {
+      setHandoffError("SBAR Export failed.");
+    } finally {
+      setIsExporting(false);
+    }
+  };
+
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
-      <nav className="border-b border-cyan-900/50 px-6 py-4 flex justify-between items-center sticky top-0 z-50 bg-slate-950/95 backdrop-blur">
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased selection:bg-indigo-500/30">
+      {/* PROFESSIONAL CLINICAL HEADER */}
+      <nav className="border-b border-slate-800 px-8 py-4 flex justify-between items-center sticky top-0 z-50 bg-slate-950/90 backdrop-blur-md">
         <div className="flex items-center gap-4">
-          <Link to="/dashboard" className="inline-flex items-center gap-2 text-slate-300 hover:text-white font-medium">
-            <ArrowLeft size={18} /> Back
+          <Link to="/dashboard" className="text-slate-400 hover:text-white transition-colors p-2 hover:bg-slate-900 rounded-lg">
+            <ArrowLeft size={20} />
           </Link>
-          <h1 className="text-2xl font-bold text-cyan-300 flex items-center gap-2">
-            <Activity className="text-cyan-300" /> Serenity Admin Observatory
+          <div className="h-8 w-px bg-slate-800 mx-1 hidden md:block" />
+          <h1 className="text-xl font-bold tracking-tight text-slate-100 flex items-center gap-2">
+            <Activity className="text-emerald-500" size={22} /> SERENITY <span className="text-slate-500 font-normal">Case Observatory</span>
           </h1>
         </div>
-
-        <div className="flex items-center gap-4">
-          <span className="text-slate-400">Signed in: {user}</span>
-          <button onClick={onLogout} className="text-rose-400 font-medium hover:text-rose-300 flex items-center gap-1">
-            <LogOut size={18} /> Logout
+        <div className="flex items-center gap-6">
+          <div className="text-right hidden sm:block">
+            <p className="text-[10px] text-slate-500 uppercase font-black tracking-widest">Authorized Clinician</p>
+            <p className="text-sm font-semibold text-slate-200">{user}</p>
+          </div>
+          <button onClick={onLogout} className="text-rose-400 text-xs font-black uppercase tracking-widest border border-rose-900/40 px-3 py-2 rounded-xl hover:bg-rose-950/30 transition-all flex items-center gap-2">
+            <LogOut size={14} /> End Session
           </button>
         </div>
       </nav>
 
-      <main className="flex-1 p-6">
-        <div className="max-w-7xl mx-auto space-y-4">
-          <section className="rounded-2xl border border-cyan-900/50 bg-slate-900/60 p-5">
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div>
-                <p className="text-xs uppercase tracking-wider text-cyan-300">Clinical Report</p>
-                <h2 className="text-xl font-semibold text-white">SERENITY Professional Evaluation: {user}</h2>
-                <p className="text-xs text-slate-500 mt-1">
-                  Generated: {formatDate(overview?.generated_at)}
-                  {overview?.summary_source ? ` • source: ${overview.summary_source}` : ''}
-                </p>
-              </div>
-
-              <div className="flex items-center gap-2">
-                <input
-                  type="number"
-                  value={limit}
-                  min={20}
-                  max={3000}
-                  onChange={(event) => setLimit(clamp(Number(event.target.value) || 300, 20, 3000))}
-                  className="w-28 rounded-lg bg-slate-950 border border-cyan-900/60 px-3 py-2 text-sm text-slate-200"
-                />
-                <button
-                  type="button"
-                  onClick={() => loadOverview(limit)}
-                  className="inline-flex items-center justify-center gap-2 rounded-lg bg-cyan-700 hover:bg-cyan-600 px-4 py-2 font-semibold"
-                >
-                  <RefreshCw size={15} /> Refresh
-                </button>
-              </div>
+      <main className="flex-1 p-6 max-w-[1600px] mx-auto w-full space-y-6">
+        
+        {/* TARASOFF / DUTY TO WARN PULSING ALERT */}
+        {profile?.duty_to_warn && (
+          <div className="p-5 bg-rose-950/30 border-2 border-rose-600 rounded-2xl flex items-center gap-5 animate-pulse shadow-[0_0_40px_rgba(225,29,72,0.15)] ring-1 ring-rose-500/50">
+            <div className="bg-rose-600 p-3 rounded-full text-white shadow-lg">
+              <AlertTriangle size={32} />
             </div>
+            <div>
+              <h3 className="text-rose-100 font-black text-lg uppercase tracking-tighter">Urgent Alert: Duty to Warn (Tarasoff Rule)</h3>
+              <p className="text-rose-200/90 text-sm font-medium">
+                Autonomous acuity monitoring has flagged language indicating potential imminent harm to others. 
+                Perform an immediate manual review of encounter transcripts and follow legal reporting requirements.
+              </p>
+            </div>
+          </div>
+        )}
 
-            {isLoading ? (
-              <div className="mt-4 rounded-lg border border-cyan-800/60 bg-slate-900 p-3 text-slate-300 inline-flex items-center gap-2">
-                <Loader2 className="animate-spin" size={16} /> Building profile report...
-              </div>
-            ) : (
-              <div className="mt-4 space-y-2">
-                {summaryLines.length === 0 ? (
-                  <p className="text-slate-300">No summary available yet.</p>
-                ) : (
-                  summaryLines.map((line, idx) => (
-                    <p key={`summary-${idx}`} className="text-slate-200 leading-relaxed">
-                      • {line}
+        <div className="grid grid-cols-12 gap-6">
+          
+          {/* PRIMARY CLINICAL ANALYSIS COLUMN (LEFT: 8 Columns) */}
+          <div className="col-span-12 lg:col-span-8 space-y-6">
+            
+            {/* DYNAMIC CASE FORMULATION */}
+            <section className="bg-slate-900/40 border border-slate-800 rounded-[2rem] p-6 shadow-sm overflow-hidden relative">
+              <div className="flex justify-between items-start mb-6">
+                <div className="flex items-center gap-3">
+                  <div className="p-2 bg-indigo-500/20 rounded-xl text-indigo-400">
+                    <Stethoscope size={20} />
+                  </div>
+                  <div>
+                    <h2 className="text-lg font-bold text-slate-100">Clinical Case Formulation</h2>
+                    <p className="text-[10px] text-slate-500 mt-1 uppercase tracking-widest font-black">
+                      Synthesis Engine: {clinicalReportSource === 'cloud_llm' ? 'Qwen 2.5 Inference' : 'Heuristic Fallback'} • {formatDate(clinicalReportGeneratedAt || overview?.generated_at)}
                     </p>
-                  ))
+                  </div>
+                </div>
+                <div className="flex gap-2">
+                   <button onClick={loadClinicalReport} title="Refresh Synthesis" className="p-2.5 bg-slate-800 hover:bg-slate-700 rounded-xl transition-colors text-slate-400">
+                    <RefreshCw size={16} className={isClinicalReportLoading ? 'animate-spin' : ''} />
+                  </button>
+                  <button onClick={exportClinicalHandoff} disabled={isExporting || !targetUserId} className="flex items-center gap-2 px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 rounded-xl text-xs font-black uppercase tracking-widest transition-all shadow-lg shadow-indigo-900/20">
+                    {isExporting ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+                    Export SBAR
+                  </button>
+                </div>
+              </div>
+
+              <div className={`prose prose-invert max-w-none p-6 rounded-2xl border border-slate-800/50 bg-slate-950/40 leading-relaxed text-slate-300 transition-all ${isClinicalReportLoading ? 'blur-sm grayscale opacity-50' : ''}`}>
+                {clinicalReport ? (
+                  <ReactMarkdown>{clinicalReport}</ReactMarkdown>
+                ) : (
+                  <div className="flex flex-col items-center py-10 text-slate-500 italic space-y-3">
+                     <p>Formulation synthesis required. Cloud LLM may be initializing.</p>
+                     <button onClick={loadClinicalReport} className="text-xs text-indigo-400 underline uppercase tracking-widest font-black">Retry Formulation</button>
+                  </div>
                 )}
               </div>
-            )}
 
-            {errorMessage && (
-              <div className="mt-4 rounded-lg border border-rose-600/60 bg-rose-950/30 p-3 text-rose-200 text-sm inline-flex items-center gap-2">
-                <AlertTriangle size={15} /> {errorMessage}
-              </div>
-            )}
-          </section>
-
-          <section className="rounded-2xl border border-cyan-900/50 bg-slate-900/60 p-4">
-            <h3 className="text-xs uppercase tracking-wider text-cyan-300 mb-3">Metrics Dashboard</h3>
-            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-6 gap-3">
-              {metrics.map((metric) => (
-                <article key={metric.id} className="rounded-lg border border-cyan-900/40 bg-slate-950/70 p-3">
-                  <p className="text-xs text-slate-400 inline-flex items-center gap-2">
-                    <MetricIcon id={metric.id} /> {metric.label || metric.id}
-                  </p>
-                  <p className="text-2xl font-bold text-cyan-300 mt-2">{metric.value}</p>
-                  <p className="text-xs text-slate-500 mt-1">{metric.description || ''}</p>
-                </article>
-              ))}
-            </div>
-          </section>
-
-          <section className="grid grid-cols-1 xl:grid-cols-3 gap-4">
-            <div className="xl:col-span-2 rounded-2xl border border-cyan-900/50 bg-slate-900/60 p-4 space-y-4">
-              <div className="flex items-center justify-between">
-                <h3 className="text-xs uppercase tracking-wider text-cyan-300">Risk Formulation</h3>
-                <span className={`px-2 py-1 rounded-full border text-xs font-medium uppercase ${riskTone(profile?.risk_level)}`}>
-                  {profile?.risk_level || 'stable'}
-                </span>
-              </div>
-
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
-                <article className="rounded-lg border border-cyan-900/40 bg-slate-950/70 p-3">
-                  <p className="text-xs text-slate-400 uppercase">Core Indicators</p>
-                  <p className="text-slate-200 mt-2">Risk score: <span className="text-cyan-300 font-semibold">{profile?.risk_score ?? 0}</span></p>
-                  <p className="text-slate-200">Distress signals: <span className="text-cyan-300 font-semibold">{clinical?.distress_signal_count ?? 0}</span></p>
-                  <p className="text-slate-200">Negative affect ratio: <span className="text-cyan-300 font-semibold">{clinical?.negative_emotion_ratio ?? 0}</span></p>
-                  <p className="text-slate-500 text-xs mt-2">Last seen: {formatDate(profile?.last_seen)}</p>
-                </article>
-
-                <article className="rounded-lg border border-cyan-900/40 bg-slate-950/70 p-3">
-                  <p className="text-xs text-slate-400 uppercase">Protective and Risk Factors</p>
-                  <p className="text-slate-200 mt-2">Engagement level: <span className="text-cyan-300 font-semibold">{profile?.engagement_level || 'low'}</span></p>
-                  <p className="text-slate-200">Engagement score: <span className="text-cyan-300 font-semibold">{profile?.engagement_score ?? 0}</span></p>
-                  <p className="text-slate-200">Active clinical flags:</p>
-                  <p className="text-xs text-amber-300 mt-1">
-                    {Array.isArray(profile?.active_flags) && profile.active_flags.length > 0
-                      ? profile.active_flags.join(', ')
-                      : 'none'}
-                  </p>
-                </article>
-              </div>
-
-              {profile?.latest_assistant_note && (
-                <article className="rounded-lg border border-cyan-900/40 bg-slate-950/70 p-3">
-                  <p className="text-xs text-slate-400 uppercase">Recent Therapeutic Note</p>
-                  <p className="text-sm text-slate-200 mt-2">{profile.latest_assistant_note}</p>
-                </article>
-              )}
-            </div>
-
-            <div className="space-y-4">
-              <div className="rounded-2xl border border-cyan-900/50 bg-slate-900/60 p-4">
-                <h3 className="text-xs uppercase tracking-wider text-cyan-300 mb-3">Measurement-Based Evaluation</h3>
-                <div className="space-y-2 max-h-[260px] overflow-auto pr-1">
-                  {scoreRows.length === 0 && <p className="text-slate-500 text-sm">No screening data available.</p>}
-                  {scoreRows.map((row) => (
-                    <article key={row.type} className="rounded-lg border border-cyan-900/40 bg-slate-950/70 p-3">
-                      <p className="text-sm text-cyan-300 font-semibold">{row.type}</p>
-                      <p className="text-xs text-slate-300 mt-1">Score: {row.score}</p>
-                      <p className="text-xs text-slate-300">Severity: {row.severity}</p>
-                      <p className="text-xs text-slate-300">Trend: {row.trend}</p>
-                    </article>
-                  ))}
+              {isClinicalReportLoading && (
+                <div className="absolute inset-0 flex items-center justify-center bg-slate-950/10 backdrop-blur-[2px] z-10">
+                  <div className="flex flex-col items-center gap-3">
+                    <Loader2 className="animate-spin text-indigo-500" size={36} />
+                    <p className="text-xs font-bold text-indigo-400 uppercase tracking-widest animate-pulse">Synthesizing clinical context...</p>
+                  </div>
                 </div>
-              </div>
+              )}
+              
+              {clinicalReportError && !clinicalReport && (
+                <div className="mt-4 p-3 bg-amber-950/20 border border-amber-900/50 rounded-xl text-amber-200 text-xs flex items-center gap-2">
+                  <AlertTriangle size={14} /> {clinicalReportError}
+                </div>
+              )}
+            </section>
 
-              <div className="rounded-2xl border border-cyan-900/50 bg-slate-900/60 p-4">
-                <h3 className="text-xs uppercase tracking-wider text-cyan-300 mb-3">Emotion Distribution</h3>
-                <div className="space-y-2 max-h-[220px] overflow-auto pr-1">
-                  {topEmotions.length === 0 && <p className="text-slate-500 text-sm">No emotion data available.</p>}
-                  {topEmotions.slice(0, 6).map((item) => (
-                    <div key={item.emotion} className="rounded-lg border border-cyan-900/40 bg-slate-950/70 p-3 flex items-center justify-between">
-                      <span className="text-slate-200 capitalize">{item.emotion}</span>
-                      <span className="text-cyan-300 font-semibold">{item.count}</span>
+            {/* MOVED: FRAMEWORK ENGAGEMENT FIDELITY */}
+            <section className="bg-slate-900/40 border border-slate-800 rounded-[2rem] p-6">
+              <h3 className="text-xs font-black uppercase tracking-[0.2em] text-slate-500 mb-5">Clinical Framework Engagement</h3>
+              <div className="space-y-6">
+                {protocolFidelity.length > 0 ? protocolFidelity.map((item, idx) => (
+                  <div key={idx} className="space-y-2">
+                    <div className="flex justify-between text-[11px] font-black uppercase tracking-tight">
+                      <span className="text-slate-400">{item.label}</span>
+                      <span className="text-indigo-400">{item.share}%</span>
                     </div>
-                  ))}
-                </div>
+                    <div className="h-1.5 w-full bg-slate-800/50 rounded-full overflow-hidden">
+                      <div 
+                        className={`h-full rounded-full transition-all duration-1000 ${
+                          item.tone === 'rose' ? 'bg-rose-500 shadow-[0_0_10px_rgba(244,63,94,0.3)]' : 
+                          item.tone === 'amber' ? 'bg-amber-500 shadow-[0_0_10px_rgba(245,158,11,0.3)]' : 
+                          item.tone === 'emerald' ? 'bg-emerald-500' :
+                          'bg-indigo-500 shadow-[0_0_10px_rgba(99,102,241,0.3)]'
+                        }`} 
+                        style={{ width: `${item.share}%` }} 
+                      />
+                    </div>
+                  </div>
+                )) : <p className="text-slate-600 text-xs italic text-center">No routing activity captured.</p>}
               </div>
-            </div>
-          </section>
+            </section>
 
-          <section className="rounded-2xl border border-cyan-900/50 bg-slate-900/60 p-4">
-            <h3 className="text-xs uppercase tracking-wider text-cyan-300 mb-3">Recent Conversation Notes</h3>
-            <div className="space-y-3 max-h-[400px] overflow-auto pr-1">
-              {chats.length === 0 && <p className="text-slate-500 text-sm">No conversation turns available.</p>}
-              {displayedChats.map((chat) => (
-                <article key={chat.id} className="rounded-lg border border-cyan-900/40 bg-slate-950/70 p-3 space-y-1">
-                  <p className="text-xs text-slate-400">
-                    {chat.username || 'unknown'} • {formatDate(chat.timestamp)} • emotion: {String(chat.dominant_emotion || 'neutral').toLowerCase()}
-                  </p>
-                  <p className="text-sm text-cyan-300">User: {chat.user_text}</p>
-                  <p className="text-sm text-white">Serenity: {chat.assistant_text}</p>
-                </article>
-              ))}
+            {/* ENCOUNTER TRANSCRIPTS */}
+            <section className="bg-slate-900/40 border border-slate-800 rounded-[2rem] p-6">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-xs font-black uppercase tracking-[0.2em] text-slate-500">Therapeutic Encounter Transcripts</h3>
+                <span className="text-[10px] text-slate-600 font-bold uppercase">{chats?.length || 0} Total Turns</span>
+              </div>
+              <div className="space-y-4 max-h-[550px] overflow-y-auto pr-4 custom-scrollbar">
+                {displayedChats.length > 0 ? displayedChats.map((chat, idx) => (
+                  <div key={idx} className="p-5 rounded-2xl bg-slate-950/50 border border-slate-800/50 space-y-3 hover:border-slate-700/50 transition-colors">
+                    <div className="flex justify-between text-[10px] uppercase font-black tracking-widest text-slate-500">
+                      <span>{formatDate(chat.timestamp)}</span>
+                      <span className={`px-2 py-0.5 rounded-lg border ${chat.dominant_emotion === 'Neutral' ? 'border-slate-800' : 'border-indigo-900/50 text-indigo-400 bg-indigo-950/20'}`}>
+                        Clinical Affect: {chat.dominant_emotion}
+                      </span>
+                    </div>
+                    <div className="text-sm leading-relaxed">
+                      <p className="flex gap-3"><span className="text-emerald-500 font-black shrink-0">CLIENT:</span> <span className="text-slate-200">{chat.user_text}</span></p>
+                      <p className="mt-3 flex gap-3"><span className="text-slate-500 font-black shrink-0 uppercase tracking-tighter">AI AGENT:</span> <span className="text-slate-400">{chat.assistant_text}</span></p>
+                    </div>
+                  </div>
+                )) : <p className="text-slate-600 text-sm italic text-center py-10">No recent therapeutic encounters recorded in this window.</p>}
+                
+                {chats.length > chatVisibleCount && (
+                   <button onClick={() => setChatVisibleCount(prev => prev + 30)} className="w-full py-4 text-xs font-black uppercase tracking-widest text-indigo-400 hover:text-indigo-300 transition-colors bg-slate-950/30 rounded-xl border border-slate-800/50 hover:bg-slate-900">
+                     Load Historical Logs ({chats.length - chatVisibleCount} remaining)
+                   </button>
+                )}
+              </div>
+            </section>
+          </div>
 
-              {displayedChats.length < chats.length && (
-                <button
-                  type="button"
-                  onClick={() => setChatVisibleCount((prev) => prev + 30)}
-                  className="w-full rounded-lg border border-cyan-800/60 bg-slate-900 px-3 py-2 text-sm text-cyan-300 hover:border-cyan-600"
-                >
-                  Load 30 More Notes ({displayedChats.length}/{chats.length})
-                </button>
-              )}
-            </div>
-          </section>
-
-          <section className="grid grid-cols-1 xl:grid-cols-2 gap-4">
-            <div className="rounded-2xl border border-cyan-900/50 bg-slate-900/60 p-4">
-              <h3 className="text-xs uppercase tracking-wider text-cyan-300 mb-3">Recent Questionnaire Entries</h3>
-              <div className="space-y-2 max-h-[260px] overflow-auto pr-1">
-                {questionnaireResults.length === 0 && <p className="text-slate-500 text-sm">No questionnaire entries found.</p>}
-                {questionnaireResults.slice(0, 12).map((row) => (
-                  <article key={row.id} className="rounded-lg border border-cyan-900/40 bg-slate-950/70 p-3">
-                    <p className="text-xs text-slate-400">
-                      {row.username || 'unknown'} • {row.questionnaire_type} • {formatDate(row.created_at)}
+          {/* QUANTITATIVE INDICES COLUMN (RIGHT: 4 Columns) */}
+          <div className="col-span-12 lg:col-span-4 space-y-6">
+            
+            {/* ACUITY INDICES */}
+            <section className="bg-slate-900/40 border border-slate-800 rounded-[2rem] p-6">
+              <h3 className="text-xs font-black uppercase tracking-[0.2em] text-slate-500 mb-5">Current Acuity Indices</h3>
+              <div className="grid grid-cols-2 gap-4">
+                {metrics.map((m, i) => (
+                  <div key={i} className="p-4 rounded-2xl bg-slate-950/50 border border-slate-800/50 hover:bg-slate-900/50 transition-colors">
+                    <p className="text-[10px] uppercase font-black text-slate-500 tracking-tighter flex items-center gap-2">
+                       <MetricIcon id={m.id} /> {m.label || m.id}
                     </p>
-                    <p className="text-sm text-cyan-300">Score: {row.total_score}</p>
-                    <p className="text-xs text-slate-300">Severity: {row.severity}</p>
-                  </article>
+                    <p className="text-2xl font-black text-emerald-400 mt-1">{m.value}</p>
+                    {m.delta !== undefined && m.delta !== null && m.id !== 'care_plan_adherence' && (
+                      <div className={`mt-2 inline-flex items-center text-[10px] font-black px-2 py-0.5 rounded-lg ${m.delta > 0 ? 'bg-rose-950/50 text-rose-400 border border-rose-900/50' : 'bg-emerald-950/50 text-emerald-400 border border-emerald-900/50'}`}>
+                        {m.delta > 0 ? '↑' : '↓'} {Math.abs(m.delta)} {m.delta_label || 'Shift'}
+                      </div>
+                    )}
+                  </div>
                 ))}
               </div>
-            </div>
+            </section>
 
-            <div className="rounded-2xl border border-cyan-900/50 bg-slate-900/60 p-4">
-              <h3 className="text-xs uppercase tracking-wider text-cyan-300 mb-3">Session Timeline</h3>
-              <div className="space-y-2 max-h-[260px] overflow-auto pr-1">
-                {sessions.length === 0 && <p className="text-slate-500 text-sm">No legacy sessions available.</p>}
-                {sessions.slice(0, 8).map((session) => (
-                  <article key={session.id} className="rounded-lg border border-cyan-900/40 bg-slate-950/70 p-3">
-                    <p className="text-xs text-slate-400">
-                      Session #{session.id} • {session.username || 'unknown'} • {formatDate(session.timestamp)}
-                    </p>
-                    <p className="text-xs text-slate-300 mt-1 line-clamp-2">
-                      {session.conversation || 'No conversation text stored for this session.'}
-                    </p>
-                  </article>
-                ))}
+             {/* MEASUREMENT-BASED SCREENING (PHQ/GAD/PCL) */}
+             <section className="bg-slate-900/40 border border-slate-800 rounded-[2rem] p-6">
+              <h3 className="text-xs font-black uppercase tracking-[0.2em] text-slate-500 mb-5">Screening Metrics (MBC)</h3>
+              <div className="space-y-3 max-h-[260px] overflow-y-auto pr-2 custom-scrollbar">
+                {scoreRows.length > 0 ? scoreRows.map((row) => (
+                  <div key={row.type} className="p-4 rounded-2xl bg-slate-950/50 border border-slate-800/50 flex justify-between items-center group hover:border-slate-700 transition-colors">
+                    <div>
+                      <p className="text-xs font-black text-slate-100 group-hover:text-indigo-400 transition-colors">{row.type}</p>
+                      <p className={`text-[10px] font-bold uppercase mt-1 px-2 py-0.5 rounded-md inline-block ${acuityTone(row.trend)}`}>{row.severity} • {row.trend}</p>
+                    </div>
+                    <p className="text-2xl font-black text-slate-300 group-hover:text-white transition-colors">{row.score}</p>
+                  </div>
+                )) : <p className="text-slate-600 text-xs italic text-center py-4">No measurement-based data available.</p>}
               </div>
-            </div>
-          </section>
+            </section>
 
-          <section className="rounded-2xl border border-cyan-900/50 bg-slate-900/60 p-4">
-            <h3 className="text-xs uppercase tracking-wider text-cyan-300 mb-3 inline-flex items-center gap-2">
-              <FileText size={14} /> Professional Technique Signals
-            </h3>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
-              <article className="rounded-lg border border-cyan-900/40 bg-slate-950/70 p-3">
-                <p className="text-xs text-slate-400 uppercase">Measurement-Based Care</p>
-                <p className="text-slate-200 mt-2">Uses PHQ-9, GAD-7, and PCL-5 latest scores with trend interpretation.</p>
-              </article>
-              <article className="rounded-lg border border-cyan-900/40 bg-slate-950/70 p-3">
-                <p className="text-xs text-slate-400 uppercase">Structured Risk Formulation</p>
-                <p className="text-slate-200 mt-2">Combines screening flags, distress language signals, and affect ratio into risk score.</p>
-              </article>
-              <article className="rounded-lg border border-cyan-900/40 bg-slate-950/70 p-3">
-                <p className="text-xs text-slate-400 uppercase">Trauma-Informed Follow-up</p>
-                <p className="text-slate-200 mt-2">Summaries prioritize safety planning, non-judgmental check-ins, and cadence targets.</p>
-              </article>
-            </div>
-          </section>
+             {/* AFFECTIVE PRESENTATION (Emotion Distribution) */}
+             <section className="bg-slate-900/40 border border-slate-800 rounded-[2rem] p-6">
+              <h3 className="text-xs font-black uppercase tracking-[0.2em] text-slate-500 mb-5">Affective Presentation</h3>
+              <div className="space-y-3 max-h-[220px] overflow-y-auto pr-2 custom-scrollbar">
+                {topEmotions.length > 0 ? topEmotions.slice(0, 6).map((item) => (
+                  <div key={item.emotion} className="p-3 rounded-xl bg-slate-950/50 border border-slate-800/50 flex items-center justify-between">
+                    <span className="text-slate-300 text-sm font-semibold capitalize">{item.emotion}</span>
+                    <span className="text-indigo-400 font-black">{item.count}</span>
+                  </div>
+                )) : <p className="text-slate-600 text-xs italic text-center py-4">No affective data captured.</p>}
+              </div>
+            </section>
+
+            {/* LONGITUDINAL CLINICAL TIMELINE */}
+            <section className="bg-slate-900/40 border border-slate-800 rounded-[2rem] p-6">
+              <h3 className="text-xs font-black uppercase tracking-[0.2em] text-slate-500 mb-5">Clinical Activity History</h3>
+              <div className="space-y-6 border-l-2 border-slate-800 ml-2 pl-6 relative max-h-[400px] overflow-y-auto custom-scrollbar">
+                {timelineEvents.length > 0 ? timelineEvents.slice(0, 10).map((ev, i) => (
+                  <div key={i} className="relative">
+                    <div className={`absolute -left-[32px] top-1 flex h-6 w-6 items-center justify-center rounded-full border-2 border-slate-950 shadow-sm ${
+                       ev.kind === 'safety' ? 'bg-rose-500 shadow-rose-900/50 text-white' : 'bg-slate-800 text-indigo-400'
+                    }`}>
+                      <div className="scale-[0.6]">
+                         {ev.kind === 'safety' ? <AlertTriangle /> : <Clock3 />}
+                      </div>
+                    </div>
+                    <p className="text-[10px] font-black text-slate-500 uppercase tracking-widest">{formatDate(ev.timestamp).split(',')[0]}</p>
+                    <h4 className="text-xs font-bold text-slate-200 mt-0.5 leading-tight">{ev.title}</h4>
+                    <p className="text-[11px] text-slate-400 mt-1 leading-snug line-clamp-2">{ev.detail}</p>
+                  </div>
+                )) : <p className="text-slate-600 text-xs italic">No longitudinal activity available.</p>}
+              </div>
+            </section>
+
+          </div>
         </div>
       </main>
     </div>

@@ -1,117 +1,118 @@
 import React from 'react';
-import { Activity, ClipboardList, Compass, FileText, LogOut, Radar, Shield, TrendingUp } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
+import { 
+  Activity, 
+  ShieldAlert, 
+  MessageSquare, 
+  ClipboardList, 
+  BrainCircuit, 
+  Cpu, 
+  LogOut 
+} from 'lucide-react';
 
 const Dashboard = ({ user, onLogout }) => {
   const navigate = useNavigate();
 
-  const navCards = [
+  const modules = [
     {
-      id: 'questionnaires',
-      title: 'Questionnaires',
-      subtitle: 'PHQ-9, GAD-7, PCL-5',
-      description: 'Complete one assessment or all assessments and store dated results in your local database.',
-      icon: ClipboardList,
-      to: '/questionnaires',
-      buttonClass: 'bg-indigo-700 hover:bg-indigo-600',
+      title: 'Clinical Assessment',
+      description: 'Complete standardized diagnostic tools including PHQ-9, GAD-7, and PCL-5 to establish baseline acuity.',
+      icon: <ClipboardList size={36} className="text-indigo-400" />,
+      path: '/questionnaires',
+      glow: 'group-hover:shadow-[0_0_30px_rgba(99,102,241,0.2)] border-indigo-900/30 group-hover:border-indigo-500/50',
+      iconBg: 'bg-indigo-950/40',
     },
     {
-      id: 'live-emotion',
-      title: 'Live Emotion Session',
-      subtitle: 'Voice + visual support',
-      description: 'Start a real-time support conversation with microphone, camera, and streaming response feedback.',
-      icon: Radar,
-      to: '/emotion/live',
-      buttonClass: 'bg-cyan-700 hover:bg-cyan-600',
+      title: 'Live Support Session',
+      description: 'Engage in a real-time therapeutic dialogue with autonomous facial and vocal emotion tracking.',
+      icon: <MessageSquare size={36} className="text-emerald-400" />,
+      path: '/session',
+      glow: 'group-hover:shadow-[0_0_30px_rgba(16,185,129,0.2)] border-emerald-900/30 group-hover:border-emerald-500/50',
+      iconBg: 'bg-emerald-950/40',
     },
     {
-      id: 'admin',
+      title: 'Measurement-Based Care',
+      description: 'Track longitudinal symptom trajectories and receive dynamically adapted behavioral interventions.',
+      icon: <Activity size={36} className="text-cyan-400" />,
+      path: '/mbc-hub',
+      glow: 'group-hover:shadow-[0_0_30px_rgba(6,182,212,0.2)] border-cyan-900/30 group-hover:border-cyan-500/50',
+      iconBg: 'bg-cyan-950/40',
+    },
+    {
+      title: 'Safety & Coping Protocol',
+      description: 'Access deterministic crisis intervention steps, tactile grounding, and emergency escalation pathways.',
+      icon: <ShieldAlert size={36} className="text-rose-400" />,
+      path: '/safety',
+      glow: 'group-hover:shadow-[0_0_30px_rgba(244,63,94,0.2)] border-rose-900/30 group-hover:border-rose-500/50',
+      iconBg: 'bg-rose-950/40',
+    },
+    {
       title: 'Admin Observatory',
-      subtitle: 'Local analytics dashboard',
-      description: 'Review chats, sessions, emotions, questionnaire outcomes, and mental health trend summaries.',
-      icon: Shield,
-      to: '/admin',
-      buttonClass: 'bg-emerald-700 hover:bg-emerald-600',
+      description: 'Review structured case formulations, aggregate acuity indices, and export SBAR clinical handoffs.',
+      icon: <BrainCircuit size={36} className="text-amber-400" />,
+      path: '/admin',
+      glow: 'group-hover:shadow-[0_0_30px_rgba(245,158,11,0.2)] border-amber-900/30 group-hover:border-amber-500/50',
+      iconBg: 'bg-amber-950/40',
     },
     {
-      id: 'care-plan',
-      title: 'Personal Care Plan',
-      subtitle: 'Personality + routine guidance',
-      description: 'View your adaptive routine, micro-interventions, safety steps, and weekly targets based on your interaction profile.',
-      icon: Compass,
-      to: '/care-plan',
-      buttonClass: 'bg-amber-700 hover:bg-amber-600',
-    },
-    {
-      id: 'cbt-workbench',
-      title: 'CBT Workbench',
-      subtitle: 'Thought records + distortions',
-      description: 'Run guided cognitive restructuring sessions, detect distortion patterns, and track weekly intensity reduction progress.',
-      icon: FileText,
-      to: '/cbt-workbench',
-      buttonClass: 'bg-fuchsia-700 hover:bg-fuchsia-600',
-    },
-    {
-      id: 'clinical-handoff',
-      title: 'Clinical Handoff',
-      subtitle: 'Relapse forecast + transfer report',
-      description: 'Review relapse probability, warning/protective signals, and generate a structured handoff package for clinician transition.',
-      icon: TrendingUp,
-      to: '/clinical-handoff',
-      buttonClass: 'bg-rose-700 hover:bg-rose-600',
+      title: 'Edge Diagnostics',
+      description: 'Monitor live system telemetry, STT/SER/FER inference latencies, and hardware resource utilization.',
+      icon: <Cpu size={36} className="text-slate-400" />,
+      path: '/diagnostics',
+      glow: 'group-hover:shadow-[0_0_30px_rgba(148,163,184,0.2)] border-slate-700/50 group-hover:border-slate-400/50',
+      iconBg: 'bg-slate-800/50',
     },
   ];
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
-      <nav className="border-b border-cyan-900/50 px-8 py-4 flex justify-between items-center sticky top-0 z-50 bg-slate-950/95 backdrop-blur">
-        <h1 className="text-2xl font-bold text-cyan-300 flex items-center gap-2">
-          <Activity className="text-cyan-300" /> SERENITY Dashboard
-        </h1>
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans antialiased selection:bg-indigo-500/30">
+      {/* PROFESSIONAL NAV */}
+      <nav className="border-b border-slate-800 px-8 py-5 flex justify-between items-center sticky top-0 z-50 bg-slate-950/90 backdrop-blur-md">
         <div className="flex items-center gap-4">
-          <span className="text-slate-400">Patient: <b>{user}</b></span>
-          <button onClick={onLogout} className="text-rose-400 font-medium hover:text-rose-300 flex items-center gap-1">
-            <LogOut size={18} /> Logout
+          <Activity className="text-emerald-500" size={26} />
+          <h1 className="text-2xl font-black tracking-tight text-slate-100 uppercase">
+            SERENITY <span className="text-slate-500 font-normal">Dashboard</span>
+          </h1>
+        </div>
+        <div className="flex items-center gap-6">
+          <div className="text-right hidden sm:block">
+            <p className="text-[10px] text-slate-500 uppercase font-black tracking-widest">Active Profile</p>
+            <p className="text-sm font-semibold text-slate-200">{user}</p>
+          </div>
+          <button onClick={onLogout} className="text-rose-400 text-xs font-black uppercase tracking-widest border border-rose-900/40 px-4 py-2.5 rounded-xl hover:bg-rose-950/30 transition-all flex items-center gap-2">
+            <LogOut size={16} /> End Session
           </button>
         </div>
       </nav>
 
-      <main className="flex-1 p-6">
-        <div className="max-w-6xl mx-auto">
-          <div className="rounded-2xl border border-cyan-900/50 bg-slate-900/60 p-5 mb-4">
-            <p className="text-xs uppercase tracking-wider text-cyan-300">Session Hub</p>
-            <h2 className="text-3xl font-bold text-white mt-2">Welcome, {user}</h2>
-            <p className="text-slate-300 mt-2 max-w-3xl">
-              Choose where to continue: fill clinical questionnaires, launch a live support session, or monitor full local insights from the admin observatory.
-            </p>
-          </div>
+      <main className="flex-1 p-6 md:p-10 max-w-[1600px] mx-auto w-full">
+        {/* HEADER */}
+        <div className="mb-10 text-center space-y-4 max-w-3xl mx-auto">
+          <p className="text-[10px] uppercase font-black tracking-[0.3em] text-indigo-500">Clinical AI Interface</p>
+          <h2 className="text-4xl md:text-5xl font-black text-white tracking-tight">Select a Workflow</h2>
+          <p className="text-base text-slate-400 leading-relaxed">
+            Welcome to the SERENITY system. Select a module below to initiate care delivery, run assessments, or review clinical telemetry.
+          </p>
+        </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-6 gap-4">
-            {navCards.map((card) => {
-              const Icon = card.icon;
-              return (
-                <article
-                  key={card.id}
-                  className="rounded-2xl border border-cyan-900/50 bg-slate-900/60 p-5 flex flex-col min-h-[280px]"
-                >
-                  <div className="inline-flex items-center justify-center w-11 h-11 rounded-lg bg-slate-950 border border-cyan-900/60 mb-4 text-cyan-300">
-                    <Icon size={20} />
-                  </div>
-                  <h3 className="text-xl font-semibold text-white">{card.title}</h3>
-                  <p className="text-cyan-300 text-sm mt-1">{card.subtitle}</p>
-                  <p className="text-slate-300 text-sm mt-3 flex-1">{card.description}</p>
-
-                  <button
-                    type="button"
-                    onClick={() => navigate(card.to)}
-                    className={`mt-5 inline-flex items-center justify-center rounded-lg px-4 py-2 font-semibold ${card.buttonClass}`}
-                  >
-                    Open {card.title}
-                  </button>
-                </article>
-              );
-            })}
-          </div>
+        {/* LARGE CENTERED CARDS GRID */}
+        <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-8">
+          {modules.map((mod, idx) => (
+            <button
+              key={idx}
+              onClick={() => navigate(mod.path)}
+              className={`group relative flex flex-col items-center text-center p-10 bg-slate-900/40 rounded-[2rem] border transition-all duration-500 hover:-translate-y-2 ${mod.glow}`}
+            >
+              {/* ICON WRAPPER */}
+              <div className={`mb-6 p-6 rounded-[1.5rem] border border-slate-700/50 shadow-inner transition-transform duration-500 group-hover:scale-110 ${mod.iconBg}`}>
+                {mod.icon}
+              </div>
+              
+              {/* TEXT */}
+              <h3 className="text-xl font-black text-slate-100 mb-3 tracking-wide">{mod.title}</h3>
+              <p className="text-sm text-slate-400 leading-relaxed">{mod.description}</p>
+            </button>
+          ))}
         </div>
       </main>
     </div>
