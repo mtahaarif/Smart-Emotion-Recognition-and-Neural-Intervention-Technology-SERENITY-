@@ -3,431 +3,301 @@ import json
 import os
 import re
 import time
-from typing import Any, AsyncIterator, Dict, List, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+
 import httpx
 
-class CloudLLMError(RuntimeError): pass
-
-BLOCK_RE = re.compile(r"[\[\]{}<>~`Ãâð]|\([a-zA-Z\s]*\)|[\U00010000-\U0010FFFF]", re.IGNORECASE)
-MULTI_SPACE_RE = re.compile(r"\s{2,}")
 PROTOCOL_DELIMITER = "|||"
 
+# Hard-kill regex — fires the microsecond ANY of these chars arrive in a token.
+# The stream is severed before that char ever reaches the frontend or Edge TTS.
+_BLOCK_RE    = re.compile(r"[<\[\]{}>~`]|\([a-zA-Z\s]+\)", re.IGNORECASE)
+_MULTI_SP_RE = re.compile(r" {2,}")
+_KILL_DEFAULT = "user:,assistant:,reflecting,follow-up"
 
-def _env_int(name: str, default: int, minimum: int = 1) -> int:
-    try:
-        return max(minimum, int(os.getenv(name, str(default)).strip()))
-    except (TypeError, ValueError, AttributeError):
-        return max(minimum, default)
+
+class CloudLLMError(RuntimeError):
+    pass
 
 
 def _env_float(name: str, default: float, minimum: float = 0.1) -> float:
-    try:
-        return max(minimum, float(os.getenv(name, str(default)).strip()))
-    except (TypeError, ValueError, AttributeError):
-        return max(minimum, default)
+    try:    return max(minimum, float(os.getenv(name, str(default)).strip()))
+    except: return max(minimum, default)
 
 
-def _format_exception_detail(exc: Exception | None) -> str:
-    if not exc:
-        return "Unknown error"
-    message = str(exc).strip()
-    if message:
-        return f"{type(exc).__name__}: {message}"
-    return type(exc).__name__
+def _env_int(name: str, default: int, minimum: int = 1) -> int:
+    try:    return max(minimum, int(os.getenv(name, str(default)).strip()))
+    except: return max(minimum, default)
 
 
 def _parse_urls() -> List[str]:
-    primary = os.getenv("SERENITY_CLOUD_LLM_URL", "http://51.21.162.77:8000/chat").strip()
-    fallback_raw = os.getenv("SERENITY_CLOUD_LLM_FALLBACK_URLS", "")
-    urls = [primary] + [u.strip() for u in str(fallback_raw).split(",") if u.strip()]
-    deduped = []
-    for url in urls:
-        if url and url not in deduped:
-            deduped.append(url)
-    return deduped or ["http://51.21.162.77:8000/chat"]
+    primary  = os.getenv("SERENITY_CLOUD_LLM_URL", "http://51.21.162.77:8000/chat").strip()
+    fallback = [u.strip() for u in os.getenv("SERENITY_CLOUD_LLM_FALLBACK_URLS", "").split(",") if u.strip()]
+    seen, out = set(), []
+    for url in [primary] + fallback:
+        if url and url not in seen: seen.add(url); out.append(url)
+    return out or [primary]
+
 
 class CloudLLMClient:
-    """Edge-focused async client with fail-fast controls and SSE parsing."""
     __slots__ = (
-        "api_urls",
-        "active_url_idx",
-        "timeout_seconds",
-        "connect_timeout_seconds",
-        "client",
-        "kill_phrases",
-        "tail_keep",
-        "failure_count",
-        "failure_threshold",
-        "cooldown_seconds",
-        "cooldown_until",
+        "api_urls", "_active_idx", "timeout", "connect_timeout",
+        "client", "kill_phrases", "_tail_keep",
+        "_failures", "_failure_threshold", "_cooldown_seconds", "_cooldown_until",
     )
 
     def __init__(self) -> None:
-        self.api_urls = _parse_urls()
-        self.active_url_idx = 0
-        self.timeout_seconds = _env_float("SERENITY_CLOUD_LLM_TIMEOUT_SECONDS", 60.0, minimum=1.0)
-        self.connect_timeout_seconds = _env_float("SERENITY_CLOUD_LLM_CONNECT_TIMEOUT_SECONDS", 3.0, minimum=0.1)
+        self.api_urls        = _parse_urls()
+        self._active_idx     = 0
+        self.timeout         = _env_float("SERENITY_CLOUD_LLM_TIMEOUT_SECONDS", 60.0)
+        self.connect_timeout = _env_float("SERENITY_CLOUD_LLM_CONNECT_TIMEOUT_SECONDS", 3.0, 0.1)
 
-        pool_connections = _env_int("SERENITY_CLOUD_LLM_POOL_CONNECTIONS", 4, minimum=1)
-        pool_maxsize = max(pool_connections, _env_int("SERENITY_CLOUD_LLM_POOL_MAXSIZE", 8, minimum=1))
+        pool = _env_int("SERENITY_CLOUD_LLM_POOL_MAXSIZE", 8)
         self.client = httpx.AsyncClient(
             limits=httpx.Limits(
-                max_connections=pool_maxsize,
-                max_keepalive_connections=pool_connections,
+                max_connections=pool,
+                max_keepalive_connections=max(2, pool // 2),
                 keepalive_expiry=45.0,
             ),
             timeout=httpx.Timeout(
-                connect=self.connect_timeout_seconds,
-                read=self.timeout_seconds,
-                write=self.connect_timeout_seconds,
-                pool=self.connect_timeout_seconds,
+                connect=self.connect_timeout, read=self.timeout,
+                write=self.connect_timeout, pool=self.connect_timeout,
             ),
-            trust_env=os.getenv("SERENITY_CLOUD_LLM_TRUST_ENV", "false").lower() == "true",
             http2=os.getenv("SERENITY_CLOUD_LLM_HTTP2", "false").lower() == "true",
         )
 
-        raw_kill_phrases = os.getenv("SERENITY_CLOUD_LLM_KILL_PHRASES", "user:,assistant:,reflecting,follow-up")
-        self.kill_phrases = tuple(
-            phrase.strip().lower()
-            for phrase in str(raw_kill_phrases).split(",")
-            if phrase.strip()
-        )
-        self.tail_keep = max(0, max((len(phrase) for phrase in self.kill_phrases), default=0) - 1)
+        raw_kill          = os.getenv("SERENITY_CLOUD_LLM_KILL_PHRASES", _KILL_DEFAULT)
+        self.kill_phrases = tuple(p.strip().lower() for p in raw_kill.split(",") if p.strip())
+        self._tail_keep   = max(0, max((len(p) for p in self.kill_phrases), default=0) - 1)
 
-        self.failure_count = 0
-        self.failure_threshold = _env_int("SERENITY_CLOUD_LLM_FAILURE_THRESHOLD", 3, minimum=1)
-        self.cooldown_seconds = _env_float("SERENITY_CLOUD_LLM_COOLDOWN_SECONDS", 20.0, minimum=1.0)
-        self.cooldown_until = 0.0
+        self._failures          = 0
+        self._failure_threshold = _env_int("SERENITY_CLOUD_LLM_FAILURE_THRESHOLD", 3)
+        self._cooldown_seconds  = _env_float("SERENITY_CLOUD_LLM_COOLDOWN_SECONDS", 20.0)
+        self._cooldown_until    = 0.0
 
-    def _is_cooling_down(self) -> bool:
-        return time.time() < self.cooldown_until
+    # --- Circuit-breaker ---
+    def _cooling(self) -> bool: return time.time() < self._cooldown_until
 
     def _record_failure(self) -> None:
-        self.failure_count += 1
-        if self.failure_count >= self.failure_threshold:
-            self.cooldown_until = time.time() + self.cooldown_seconds
+        self._failures += 1
+        if self._failures >= self._failure_threshold:
+            self._cooldown_until = time.time() + self._cooldown_seconds
 
     def _record_success(self) -> None:
-        self.failure_count = 0
-        self.cooldown_until = 0.0
+        self._failures       = 0
+        self._cooldown_until = 0.0
 
-    def _iter_url_indexes(self) -> List[int]:
-        active = max(0, min(self.active_url_idx, len(self.api_urls) - 1))
-        return [active] + [idx for idx in range(len(self.api_urls)) if idx != active]
+    # --- Text helpers ---
+    @staticmethod
+    def _clean(text: str) -> str:
+        if not text: return ""
+        t = text.replace("\r", "").replace("\n", " ").replace("\t", " ")
+        return _MULTI_SP_RE.sub(" ", t) if "  " in t else t
 
-    def _first_cutoff_index(self, text: str) -> int:
-        asterisk = text.find("*")
-        hash_index = text.find("#")
-        if asterisk != -1 and hash_index != -1:
-            return min(asterisk, hash_index)
-        if asterisk != -1:
-            return asterisk
-        if hash_index != -1:
-            return hash_index
-        if match := BLOCK_RE.search(text):
-            return match.start()
-        return -1
+    def _cutoff_index(self, text: str) -> int:
+        m = _BLOCK_RE.search(text)
+        return m.start() if m else -1
 
-    def _clean(self, text: str) -> str:
-        if not text:
-            return ""
-        if "\r" in text:
-            text = text.replace("\r", "")
-        if "\n" in text or "\t" in text:
-            text = text.replace("\n", " ").replace("\t", " ")
-        if "  " in text:
-            text = MULTI_SPACE_RE.sub(" ", text)
-        return text
+    def _kill_trim(self, text: str) -> Tuple[str, bool]:
+        lo  = text.lower()
+        idx = min((lo.find(p) for p in self.kill_phrases if lo.find(p) >= 0), default=-1)
+        return (text[:idx], True) if idx >= 0 else (text, False)
 
-    def _trim_kill_phrase(self, text: str) -> Tuple[str, bool]:
-        lowered = text.lower()
-        best_index = -1
-        for phrase in self.kill_phrases:
-            candidate = lowered.find(phrase)
-            if candidate >= 0:
-                if best_index == -1 or candidate < best_index:
-                    best_index = candidate
-        if best_index >= 0:
-            return text[:best_index], True
-        return text, False
-
-    def _augment_prompt(self, text: str, require_protocol_control: bool = False) -> str:
-        base_text = str(text or "").strip()
-        if not require_protocol_control:
-            return base_text
-
-        if PROTOCOL_DELIMITER in base_text:
-            return base_text
-
+    def _augment(self, text: str, proto: bool) -> str:
+        base = str(text or "").strip()
+        if not proto or PROTOCOL_DELIMITER in base: return base
         return (
-            f"{base_text}\n\n"
-            "SYSTEM CONTROL DIRECTIVE: Keep your conversational response natural and clinically supportive. "
-            "At the very end, append exactly one hidden control payload in this exact format and nothing else after it: "
-            "|||{\"advance_phase\": true/false, \"detected_distortion\": \"string\"}."
+            f"{base}\n\nSYSTEM CONTROL DIRECTIVE: At the very end append exactly: "
+            f'{PROTOCOL_DELIMITER}{{"advance_phase": true/false, "detected_distortion": "string"}}'
         )
 
-    def _normalize_protocol_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "advance_phase": bool(payload.get("advance_phase", False)),
-            "detected_distortion": str(payload.get("detected_distortion") or "").strip(),
-        }
-
-    def _extract_protocol_payload(self, raw_text: str) -> Tuple[str, Dict[str, Any]]:
-        text = str(raw_text or "")
-        if PROTOCOL_DELIMITER not in text:
-            return text, {}
-
-        visible_text, tail = text.split(PROTOCOL_DELIMITER, 1)
-        control_candidate = str(tail or "").strip()
-        if not control_candidate:
-            return visible_text, {}
-
-        payload_obj: Dict[str, Any] = {}
+    def _parse_protocol(self, tail: str) -> Dict[str, Any]:
+        candidate = str(tail or "").strip()
+        if not candidate: return {}
         try:
-            parsed = json.loads(control_candidate)
-            if isinstance(parsed, dict):
-                payload_obj = parsed
+            d = json.loads(candidate)
+            if isinstance(d, dict):
+                return {"advance_phase": bool(d.get("advance_phase", False)),
+                        "detected_distortion": str(d.get("detected_distortion") or "").strip()}
         except json.JSONDecodeError:
-            if match := re.search(r"(\{(?:.|\n)*\})", control_candidate):
-                with contextlib.suppress(json.JSONDecodeError):
-                    parsed = json.loads(match.group(1))
-                    if isinstance(parsed, dict):
-                        payload_obj = parsed
+            pass
+        if m := re.search(r"(\{[^}]*\})", candidate):
+            with contextlib.suppress(json.JSONDecodeError):
+                d = json.loads(m.group(1))
+                if isinstance(d, dict):
+                    return {"advance_phase": bool(d.get("advance_phase", False)),
+                            "detected_distortion": str(d.get("detected_distortion") or "").strip()}
+        return {}
 
-        if not payload_obj:
-            return visible_text, {}
-
-        return visible_text, self._normalize_protocol_payload(payload_obj)
-
-    async def _stream_once_events(
-        self,
-        url: str,
-        text: str,
-        require_protocol_control: bool = False,
+    # --- Core SSE stream (single URL) ---
+    async def _stream_once(
+        self, url: str, text: str, proto: bool,
     ) -> AsyncIterator[Dict[str, Any]]:
-        tail = ""
-        protocol_mode = False
-        protocol_buffer = ""
-        delimiter_tail = ""
-        prompt_text = self._augment_prompt(text, require_protocol_control=require_protocol_control)
+        prompt     = self._augment(text, proto)
+        tail       = ""
+        proto_mode = False
+        proto_buf  = ""
+        delim_tail = ""
 
-        async with self.client.stream("POST", url, json={"text": prompt_text}, headers={"Accept": "text/event-stream"}) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if not line or not line.startswith("data:"):
-                    continue
+        async with self.client.stream(
+            "POST", url, json={"text": prompt},
+            headers={"Accept": "text/event-stream"},
+        ) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"): continue
                 data = line[5:].strip()
-                if not data or data == "[DONE]":
-                    break
-                try:
-                    payload = json.loads(data)
-                except ValueError:
-                    continue
+                if not data or data == "[DONE]": break
 
-                if payload.get("done"):
-                    break
+                try:    payload = json.loads(data)
+                except ValueError: continue
 
+                if payload.get("done"): break
+
+                # Extract token — handle multiple server payload shapes
                 token = payload.get("token")
-                if not isinstance(token, str) or not token:
-                    continue
+                if isinstance(token, dict): token = token.get("text", "")
+                if not token: token = payload.get("response", "")
+                if not token:
+                    choices = payload.get("choices", [])
+                    if choices: token = choices[0].get("delta", {}).get("content", "")
+                if not isinstance(token, str) or not token: continue
 
-                if require_protocol_control:
-                    if protocol_mode:
-                        protocol_buffer += token
-                        continue
+                # Protocol-control extraction
+                if proto:
+                    if proto_mode: proto_buf += token; continue
+                    combined = delim_tail + token
+                    d_idx    = combined.find(PROTOCOL_DELIMITER)
+                    if d_idx != -1:
+                        token      = combined[:d_idx]
+                        proto_mode = True
+                        delim_tail = ""
+                        proto_buf += combined[d_idx + len(PROTOCOL_DELIMITER):]
+                    elif combined.endswith("||"): delim_tail, token = "||", combined[:-2]
+                    elif combined.endswith("|"):  delim_tail, token = "|",  combined[:-1]
+                    else:                          delim_tail, token = "",   combined
+                    if not token: continue
 
-                    combined = f"{delimiter_tail}{token}"
-                    delimiter_idx = combined.find(PROTOCOL_DELIMITER)
-                    if delimiter_idx != -1:
-                        token = combined[:delimiter_idx]
-                        protocol_mode = True
-                        delimiter_tail = ""
-                        protocol_buffer += combined[delimiter_idx + len(PROTOCOL_DELIMITER):]
-                    else:
-                        if combined.endswith("||"):
-                            delimiter_tail = "||"
-                            token = combined[:-2]
-                        elif combined.endswith("|"):
-                            delimiter_tail = "|"
-                            token = combined[:-1]
-                        else:
-                            delimiter_tail = ""
-                            token = combined
-
-                    if not token:
-                        continue
-
-                cutoff_index = self._first_cutoff_index(token)
-                if cutoff_index != -1:
-                    safe = self._clean(token[:cutoff_index])
-                    if safe:
+                # ── HARD-KILL: fires instantly on < [ { > } ~ ` ──────────────
+                ci = self._cutoff_index(token)
+                if ci != -1:
+                    if safe := self._clean(token[:ci]):
                         yield {"type": "assistant_delta", "delta": safe}
                     yield {"type": "cutoff"}
-                    return
+                    return          # connection severed — no further tokens emitted
 
-                combined = (tail + token).lower()
-                if any(phrase in combined for phrase in self.kill_phrases):
+                # Kill-phrase rolling tail check
+                combined_lo = (tail + token).lower()
+                if any(p in combined_lo for p in self.kill_phrases):
                     yield {"type": "cutoff"}
                     return
 
-                cleaned = self._clean(token)
-                if cleaned:
+                # Emit token to frontend INSTANTLY (zero buffering)
+                if cleaned := self._clean(token):
                     yield {"type": "assistant_delta", "delta": cleaned}
 
-                if self.tail_keep:
-                    tail = (tail + token.lower())[-self.tail_keep:]
+                if self._tail_keep:
+                    tail = (tail + token.lower())[-self._tail_keep:]
 
-            if require_protocol_control and not protocol_mode and delimiter_tail:
-                cleaned_tail = self._clean(delimiter_tail)
-                if cleaned_tail:
-                    yield {"type": "assistant_delta", "delta": cleaned_tail}
+        # Flush partial delimiter suffix after normal stream end
+        if proto and not proto_mode and delim_tail:
+            if cleaned := self._clean(delim_tail):
+                yield {"type": "assistant_delta", "delta": cleaned}
 
-            if require_protocol_control and protocol_buffer.strip():
-                _, protocol_payload = self._extract_protocol_payload(f"{PROTOCOL_DELIMITER}{protocol_buffer}")
-                if protocol_payload:
-                    yield {"type": "protocol_control", "payload": protocol_payload}
+        # Emit protocol-control block (arrives after all visible tokens)
+        if proto and proto_buf.strip():
+            if pc := self._parse_protocol(proto_buf):
+                yield {"type": "protocol_control", "payload": pc}
 
+    # --- Public streaming API ---
     async def stream_serenity_events(
         self,
         user_text: str,
         require_protocol_control: bool = False,
     ) -> AsyncIterator[Dict[str, Any]]:
-        if not (text := str(user_text or "").strip()):
-            return
-        if self._is_cooling_down() and len(self.api_urls) == 1:
-            raise CloudLLMError("Cloud LLM temporarily cooling down after failures")
+        text = str(user_text or "").strip()
+        if not text: return
+        if self._cooling() and len(self.api_urls) == 1:
+            raise CloudLLMError("LLM in cooldown")
 
-        last_error: Exception | None = None
-        url_indexes = self._iter_url_indexes()
-        for idx in url_indexes:
-            emitted_any = False
+        idxs = [self._active_idx] + [i for i in range(len(self.api_urls)) if i != self._active_idx]
+        last_error: Optional[Exception] = None
+
+        for idx in idxs:
+            emitted = False
             try:
-                async for event in self._stream_once_events(
-                    self.api_urls[idx],
-                    text,
-                    require_protocol_control=require_protocol_control,
-                ):
-                    emitted_any = True
-                    yield event
-                self.active_url_idx = idx
+                async for ev in self._stream_once(self.api_urls[idx], text, require_protocol_control):
+                    emitted = True
+                    yield ev
+                self._active_idx = idx
                 self._record_success()
                 return
             except (httpx.HTTPError, httpx.TimeoutException, ValueError) as exc:
                 last_error = exc
                 self._record_failure()
-                if emitted_any or idx == url_indexes[-1] or self._is_cooling_down():
-                    break
+                if emitted or idx == idxs[-1] or self._cooling(): break
 
-        raise CloudLLMError(f"Stream failed: {_format_exception_detail(last_error)}")
+        raise CloudLLMError(f"Stream failed: {type(last_error).__name__}: {last_error}")
 
-    async def stream_serenity(self, user_text: str) -> AsyncIterator[str]:
-        async for event in self.stream_serenity_events(user_text, require_protocol_control=False):
-            event_type = str(event.get("type") or "")
-            if event_type == "assistant_delta":
-                delta = str(event.get("delta") or "")
-                if delta:
-                    yield delta
-            elif event_type == "cutoff":
-                yield "<CUTOFF>"
-
+    # --- Non-streaming (single request) ---
     async def _ask_once(
-        self,
-        url: str,
-        text: str,
-        timeout_seconds: float,
-        require_protocol_control: bool = False,
+        self, url: str, text: str, timeout: float, proto: bool,
     ) -> Tuple[str, Dict[str, Any]]:
-        prompt_text = self._augment_prompt(text, require_protocol_control=require_protocol_control)
-        response = await self.client.post(
-            url,
-            json={"text": prompt_text},
+        resp = await self.client.post(
+            url, json={"text": self._augment(text, proto)},
             timeout=httpx.Timeout(
-                connect=self.connect_timeout_seconds,
-                read=timeout_seconds,
-                write=self.connect_timeout_seconds,
-                pool=self.connect_timeout_seconds,
+                connect=self.connect_timeout, read=timeout,
+                write=self.connect_timeout, pool=self.connect_timeout,
             ),
         )
-        response.raise_for_status()
+        resp.raise_for_status()
+        ct      = resp.headers.get("content-type", "")
+        payload = resp.json() if "application/json" in ct else {}
+        answer  = payload.get("response") or payload.get("text") or resp.text or ""
+        if not isinstance(answer, str): return "", {}
 
-        content_type = response.headers.get("Content-Type", "").lower()
-        payload = response.json() if "application/json" in content_type else {}
-        answer = payload.get("response") or payload.get("text") or payload.get("message", {}).get("content", response.text)
-        if not isinstance(answer, str):
-            return "", {}
+        protocol: Dict[str, Any] = {}
+        if proto and PROTOCOL_DELIMITER in answer:
+            answer, tail = answer.split(PROTOCOL_DELIMITER, 1)
+            protocol     = self._parse_protocol(tail)
 
-        protocol_payload: Dict[str, Any] = {}
-        if require_protocol_control:
-            answer, protocol_payload = self._extract_protocol_payload(answer)
+        ci = self._cutoff_index(answer)
+        if ci != -1: answer = answer[:ci]
+        answer, _ = self._kill_trim(answer)
+        answer    = self._clean(answer).strip()
+        if answer:
+            if m := list(re.finditer(r"[.!?]", answer)):
+                answer = answer[:m[-1].end()].strip()
+        return answer, protocol
 
-        cutoff_hit = False
-        cutoff_index = self._first_cutoff_index(answer)
-        if cutoff_index != -1:
-            answer = answer[:cutoff_index]
-            cutoff_hit = True
-
-        answer, phrase_cut = self._trim_kill_phrase(answer)
-        cutoff_hit = cutoff_hit or phrase_cut
-        answer = self._clean(answer).strip()
-
-        if cutoff_hit and answer:
-            punctuation_matches = list(re.finditer(r"[.!?]", answer))
-            if punctuation_matches:
-                answer = answer[: punctuation_matches[-1].end()].strip()
-        return answer, protocol_payload
-
-    async def _ask_with_options(
-        self,
-        user_text: str,
-        timeout: float | None = None,
-        require_protocol_control: bool = False,
+    async def _ask_with_fallback(
+        self, user_text: str, timeout: Optional[float], proto: bool,
     ) -> Tuple[str, Dict[str, Any]]:
-        if not (text := str(user_text or "").strip()):
-            return "", {}
-        if self._is_cooling_down() and len(self.api_urls) == 1:
-            raise CloudLLMError("Cloud LLM temporarily cooling down after failures")
-
-        effective_timeout = max(1.0, float(timeout or self.timeout_seconds))
-        last_error: Exception | None = None
-
-        url_indexes = self._iter_url_indexes()
-        for idx in url_indexes:
+        text = str(user_text or "").strip()
+        if not text: return "", {}
+        eff  = max(1.0, float(timeout or self.timeout))
+        idxs = [self._active_idx] + [i for i in range(len(self.api_urls)) if i != self._active_idx]
+        last: Optional[Exception] = None
+        for idx in idxs:
             try:
-                answer, protocol_payload = await self._ask_once(
-                    self.api_urls[idx],
-                    text,
-                    effective_timeout,
-                    require_protocol_control=require_protocol_control,
-                )
-                self.active_url_idx = idx
+                ans, pc = await self._ask_once(self.api_urls[idx], text, eff, proto)
+                self._active_idx = idx
                 self._record_success()
-                return answer, protocol_payload
+                return ans, pc
             except (httpx.HTTPError, httpx.TimeoutException, ValueError) as exc:
-                last_error = exc
+                last = exc
                 self._record_failure()
-                if self._is_cooling_down() and idx == url_indexes[0]:
-                    break
+                if self._cooling(): break
+        raise CloudLLMError(f"Request failed: {type(last).__name__}: {last}")
 
-        raise CloudLLMError(f"Request failed: {_format_exception_detail(last_error)}")
-
-    async def ask_serenity(self, user_text: str, timeout: float | None = None) -> str:
-        answer, _ = await self._ask_with_options(
-            user_text,
-            timeout=timeout,
-            require_protocol_control=False,
-        )
-        return answer
+    async def ask_serenity(self, user_text: str, timeout: Optional[float] = None) -> str:
+        ans, _ = await self._ask_with_fallback(user_text, timeout, False)
+        return ans
 
     async def ask_serenity_with_protocol(
-        self,
-        user_text: str,
-        timeout: float | None = None,
+        self, user_text: str, timeout: Optional[float] = None,
     ) -> Tuple[str, Dict[str, Any]]:
-        return await self._ask_with_options(
-            user_text,
-            timeout=timeout,
-            require_protocol_control=True,
-        )
+        return await self._ask_with_fallback(user_text, timeout, True)
 
     async def close(self) -> None:
         await self.client.aclose()
