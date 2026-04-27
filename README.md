@@ -2,16 +2,6 @@
 
 Smart Emotion Recognition and Neural Intervention Technology (SERENITY)
 
-Master Technical Documentation and Deployment Manual
-
-Author: Muhammad Taha
-Program: Final Year Project (Computer Engineering)
-System Focus: Edge AI, Clinical Workflow Support, Multimodal Perception, Cloud LLM Orchestration
-
-Last updated: 2026-04-27
-
----
-
 ## Table of Contents
 
 1. Abstract
