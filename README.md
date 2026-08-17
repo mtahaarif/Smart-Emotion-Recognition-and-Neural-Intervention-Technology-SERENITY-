@@ -941,8 +941,8 @@ The six admin metric cards: Conversation Turns, Care Plan Adherence %, Emotion E
 | `/api/crisis/log` | POST | Body `{user_id, severity}`. Stamps `last_crisis_timestamp` (UTC ISO), sets `latest_cssrs_risk`, and sets `requires_safety_review` when severity is `High`. This is what arms the 24-hour DBT cooldown. |
 | `/api/clinical/clear-safety?username=` | POST | Clears the sticky safety flag on both the user and the clinical state |
 ![Stablization](stablization.jpg)
-![Stablization 2](stablization-2.jpg)
-![Stablization 3](stablization-3.jpg)
+![Stablization 2](stablization-2.jpeg)
+![Stablization 3](stablization-3.jpeg)
 
 ### 14.7 Diagnostics
 
