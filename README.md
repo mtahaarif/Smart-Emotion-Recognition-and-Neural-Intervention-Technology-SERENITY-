@@ -323,6 +323,7 @@ Transcription is English-locked with `beam_size=1` (latency over marginal accura
 - **No face detected:** returns `{"emotion": "No Face", "confidence": 0.0}`, which the alias table maps to `neutral`.
 - **Memory hygiene:** `frame = roi = output = None` in `finally` to release buffers immediately on constrained devices.
 - **Thread limit:** `cv2.setNumThreads(SERENITY_FER_CV2_THREADS)` (default 1) to avoid GIL contention with the TFLite interpreter.
+![Main Dashboard](main-dashboard.jpg)
 
 ### 6.4 TFLite delegate strategy (shared by SER and FER)
 
@@ -368,6 +369,7 @@ Fusion rule:
 Every stage is timed with `time.perf_counter()`. `_persist_diag()` writes one `edge_diagnostic_samples` row per turn and appends to the in-memory `deque` (`SERENITY_EDGE_DIAGNOSTICS_BUFFER_SIZE`, default 240) containing STT/SER/FER/LLM latency, total latency, process RSS in MB (via `psutil`), and both confidences.
 
 ---
+![Edge Diagnostics](edge-diagnostics.jpg)
 
 ## 7. The Clinical Reasoning Engine
 
@@ -387,6 +389,7 @@ Maximum: **10**.
 DISTRESS_RE = r"\b(hopeless|worthless|overwhelmed|panic|can't cope|cannot cope
                |self[- ]?harm|suicid|hurt myself|end my life)\b"
 ```
+![Questionnaires](questionnaires.jpg)
 
 ### 7.2 Mode determination (`determine_clinical_mode`)
 
