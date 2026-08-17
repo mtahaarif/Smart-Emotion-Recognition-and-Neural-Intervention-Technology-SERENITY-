@@ -323,7 +323,6 @@ Transcription is English-locked with `beam_size=1` (latency over marginal accura
 - **No face detected:** returns `{"emotion": "No Face", "confidence": 0.0}`, which the alias table maps to `neutral`.
 - **Memory hygiene:** `frame = roi = output = None` in `finally` to release buffers immediately on constrained devices.
 - **Thread limit:** `cv2.setNumThreads(SERENITY_FER_CV2_THREADS)` (default 1) to avoid GIL contention with the TFLite interpreter.
-![Main Dashboard](main-dashboard.jpg)
 
 ### 6.4 TFLite delegate strategy (shared by SER and FER)
 
@@ -369,7 +368,8 @@ Fusion rule:
 Every stage is timed with `time.perf_counter()`. `_persist_diag()` writes one `edge_diagnostic_samples` row per turn and appends to the in-memory `deque` (`SERENITY_EDGE_DIAGNOSTICS_BUFFER_SIZE`, default 240) containing STT/SER/FER/LLM latency, total latency, process RSS in MB (via `psutil`), and both confidences.
 
 ---
-![Edge Diagnostics](edge-diagnostics.jpg)
+![Main Dashboard](main-dashboard.jpg)
+
 
 ## 7. The Clinical Reasoning Engine
 
@@ -900,6 +900,7 @@ Same body; `user_text` is emitted before `emotion`.
 
 #### `GET /api/mbc/trajectory?username=&refresh=false`
 Creates the user if missing. `refresh=true` recomputes weekly flags before responding.
+![MBC Dashboard](mbc-dashboard.jpg)
 
 ```jsonc
 {
@@ -916,6 +917,8 @@ Creates the user if missing. `refresh=true` recomputes weekly flags before respo
   "cadence_days": 7, "snapshots": [...]
 }
 ```
+![Adherence Tracking](adherence-tracking.jpg)
+
 
 ### 14.5 Administration
 
@@ -927,6 +930,7 @@ Creates the user if missing. `refresh=true` recomputes weekly flags before respo
 | `GET /api/admin/handoff/{user_id}` | path `user_id` | Full handoff bundle: `trajectory`, `recent_turns`, `clinical_narrative`, `markdown`, `file_name`. 404 if user missing. |
 
 The six admin metric cards: Conversation Turns, Care Plan Adherence %, Emotion Events, Screening Entries, Risk Score (with delta vs prior assessment), Distress Signals (with delta vs prior 7 days).
+![History Tracker](history-tracker.jpg)
 
 ### 14.6 Safety and crisis
 
@@ -936,6 +940,9 @@ The six admin metric cards: Conversation Turns, Care Plan Adherence %, Emotion E
 | `/api/safety/handoff?username=&format=markdown\|pdf` | GET | Returns handoff markdown, or a downloadable PDF (`Content-Disposition: attachment`) |
 | `/api/crisis/log` | POST | Body `{user_id, severity}`. Stamps `last_crisis_timestamp` (UTC ISO), sets `latest_cssrs_risk`, and sets `requires_safety_review` when severity is `High`. This is what arms the 24-hour DBT cooldown. |
 | `/api/clinical/clear-safety?username=` | POST | Clears the sticky safety flag on both the user and the clinical state |
+![Stablization](stablization.jpg)
+![Stablization 2](stablization-2.jpg)
+![Stablization 3](stablization-3.jpg)
 
 ### 14.7 Diagnostics
 
@@ -947,6 +954,7 @@ The six admin metric cards: Conversation Turns, Care Plan Adherence %, Emotion E
 > **Synthetic-data caveat:** when no diagnostic samples exist yet, or when `psutil` is unavailable, `_latest_edge_sample()` and `/api/diagnostics/metrics` generate plausible **sine-wave placeholder values** rather than returning zeros. The dashboard therefore always animates — do not read those numbers as measurements until real turns have been recorded.
 
 ---
+![Edge Diagnostics](edge-diagnostics.jpg)
 
 ## 15. Frontend Architecture
 
