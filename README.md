@@ -7,6 +7,7 @@ A multimodal, edge-deployable mental-health support system that fuses speech-to-
 > **Disclaimer:** SERENITY is an academic engineering prototype for support and observability. It is **not** a medical device, does **not** provide diagnosis, and must **not** be used as a substitute for professional clinical judgement or emergency services.
 
 ----
+![Serenity Login](serenity-login.jpeg)
 
 ## Table of Contents
 
@@ -51,6 +52,7 @@ Digital mental-health tools usually fail on one of two axes: high empathy with n
 - **Edge-first runtime** — TFLite inference, in-RAM audio synthesis, bounded caches, connection pooling, circuit breakers, and SQLite WAL tuning so the whole stack runs on a Raspberry Pi 5.
 
 The architectural bet: run *perception* locally (privacy + latency), run *generation* in the cloud (quality), and keep *decision-making* deterministic and auditable in Python.
+![Serenity Dashboard](serenity-dashboard.jpeg)
 
 ### Design principles
 
