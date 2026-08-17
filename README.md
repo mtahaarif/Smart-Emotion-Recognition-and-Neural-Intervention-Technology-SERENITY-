@@ -6,7 +6,7 @@ A multimodal, edge-deployable mental-health support system that fuses speech-to-
 
 > **Disclaimer:** SERENITY is an academic engineering prototype for support and observability. It is **not** a medical device, does **not** provide diagnosis, and must **not** be used as a substitute for professional clinical judgement or emergency services.
 
----
+----
 
 ## Table of Contents
 
